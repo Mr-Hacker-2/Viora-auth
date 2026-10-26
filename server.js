@@ -229,6 +229,9 @@ async function chat(req, res, user) {
     }
   }
   let sys = a.sys;
+  if (visionRequested) {
+    sys += '\n\nIMAGE UNDERSTANDING REQUIRED: The latest user message contains one or more attached images. Inspect the actual visual content before answering. For a question like “What is this?”, identify the most likely visible object or scene, describe the visual evidence briefly, and state uncertainty only where the image genuinely does not support a confident identification. Do not ask the user to clarify merely because they wrote “this”; that refers to the attached image. Never claim you cannot see the image when image data is present. If text is visible, read it when relevant. Do not invent brand, model, or details that are not visible.';
+  }
   // Apply Viora's user-selected response style and task guidance, capped in size.
   // This is user preference text, not trusted system policy or attachment content.
   if (b.context && typeof b.context.instructions === 'string' && b.context.instructions.trim()) {
