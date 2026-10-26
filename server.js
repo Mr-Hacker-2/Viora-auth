@@ -200,7 +200,12 @@ async function webSearch(query) {
     if (results.length) return results;
     console.warn('DuckDuckGo returned no relevant results.');
   } catch (e) {
-    console.warn('DuckDuckGo search failed:', e.message);
+    const message = e?.message || String(e);
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError' || /timed? ?out|aborted/i.test(message)) {
+      console.warn('DuckDuckGo fallback timed out; continuing without those results.');
+    } else {
+      console.warn('DuckDuckGo fallback failed:', message);
+    }
   }
   return [];
 }
