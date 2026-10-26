@@ -77,34 +77,84 @@ const textOf = (html) => {
 async function webSearch(query) {
   const q = String(query || '').trim().slice(0, 500);
   if (!q) return [];
-  const response = await fetch('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q), {
-    signal: AbortSignal.timeout(10000),
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VioraSearch/1.0)', Accept: 'text/html' }
-  });
-  if (!response.ok) throw new Error('Search provider returned ' + response.status);
-  const html = (await response.text()).slice(0, 1500000), out = [], seen = new Set();
-  const decode = (v) => String(v || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, ' ').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  const blocks = html.split(/<div[^>]+class=["'][^"']*result[^"']*["'][^>]*>/i).slice(1);
-  for (const block of blocks) {
-    const a = block.match(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i)
-      || block.match(/<a[^>]+href=["']([^"']+)["'][^>]+class=["'][^"']*result__a[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
-    if (!a) continue;
-    try {
-      let href = a[1].replace(/&amp;/g, '&');
-      const parsed = new URL(href, 'https://html.duckduckgo.com');
-      if (parsed.hostname.endsWith('duckduckgo.com') && parsed.searchParams.has('uddg')) href = parsed.searchParams.get('uddg');
-      const dest = new URL(href);
-      if (!/^https?:$/.test(dest.protocol) || seen.has(dest.href)) continue;
-      const title = decode(a[2]).slice(0, 200);
+  const decode = (v) => String(v || '')
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const normalize = (items) => {
+    const out = [], seen = new Set();
+    for (const item of items) {
+      try {
+        const title = decode(item.title).slice(0, 200);
+        const url = new URL(decode(item.url));
+        const snippet = decode(item.snippet).slice(0, 700);
+        if (!title || !/^https?:$/.test(url.protocol) || seen.has(url.href)) continue;
+        seen.add(url.href);
+        out.push({ title, url: url.href, snippet });
+        if (out.length >= 6) break;
+      } catch {}
+    }
+    return out;
+  };
+  const get = async (url) => {
+    const r = await fetch(url, {
+      signal: AbortSignal.timeout(9000),
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VioraSearch/1.0)', Accept: 'text/html,application/rss+xml,application/xml;q=0.9,*/*;q=0.8' }
+    });
+    if (!r.ok) throw new Error('Provider returned ' + r.status);
+    return (await r.text()).slice(0, 1500000);
+  };
+
+  // Try DuckDuckGo's HTML results first.
+  try {
+    const html = await get('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q));
+    const blocks = html.split(/<div[^>]+class=["'][^"']*result[^"']*["'][^>]*>/i).slice(1);
+    const items = [];
+    for (const block of blocks) {
+      const a = block.match(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i)
+        || block.match(/<a[^>]+href=["']([^"']+)["'][^>]+class=["'][^"']*result__a[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
+      if (!a) continue;
+      let href = decode(a[1]);
+      try {
+        const parsed = new URL(href, 'https://html.duckduckgo.com');
+        if (parsed.hostname.endsWith('duckduckgo.com') && parsed.searchParams.has('uddg')) href = parsed.searchParams.get('uddg');
+      } catch {}
       const sm = block.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/(?:a|td)>/i);
-      const snippet = decode(sm?.[1] || '').slice(0, 700);
-      if (!title) continue;
-      seen.add(dest.href);
-      out.push({ title, url: dest.href, snippet });
-      if (out.length === 6) break;
-    } catch {}
+      items.push({ title: a[2], url: href, snippet: sm?.[1] || '' });
+    }
+    const results = normalize(items);
+    if (results.length) return results;
+    console.warn('DuckDuckGo returned HTML but no parseable results; trying RSS fallback.');
+  } catch (e) {
+    console.warn('DuckDuckGo search failed:', e.message);
   }
-  return out;
+
+  // RSS fallbacks are less dependent on search-page HTML markup.
+  const providers = [
+    'https://www.bing.com/search?format=rss&q=' + encodeURIComponent(q),
+    'https://news.google.com/rss/search?q=' + encodeURIComponent(q) + '&hl=en-US&gl=US&ceid=US:en'
+  ];
+  for (const endpoint of providers) {
+    try {
+      const xml = await get(endpoint);
+      const items = [];
+      for (const m of xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) {
+        const item = m[1];
+        const title = (item.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
+        const url = (item.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1]
+          || (item.match(/<guid[^>]*>([\s\S]*?)<\/guid>/i) || [])[1] || '';
+        const snippet = (item.match(/<description[^>]*>([\s\S]*?)<\/description>/i) || [])[1] || '';
+        items.push({ title, url, snippet });
+      }
+      const results = normalize(items);
+      if (results.length) return results;
+      console.warn('RSS search provider returned no parseable items.');
+    } catch (e) {
+      console.warn('RSS search provider failed:', e.message);
+    }
+  }
+  return [];
 }
 
 async function chat(req, res, user) {
