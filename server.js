@@ -82,6 +82,32 @@ async function webSearch(query) {
     .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'")
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
     .replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const intent = /\b(news|today|latest|breaking|this week|recent|current events|what happened)\b/i.test(q) ? 'news'
+    : /\b(trip|travel|itinerary|tourism|vacation|visit|things to do|attractions|hotel|flight)\b/i.test(q) ? 'travel'
+    : /\b(code|coding|programming|javascript|python|api|debug|error|library|framework|documentation)\b/i.test(q) ? 'technical'
+    : 'general';
+  const stop = new Set(('a an the to for of in on at and or but with from by is are was were be plan make create help me my your our their this that what how when where why can could would should please today latest recent best good guide official trip travel itinerary vacation visit things attractions city country find search information about').split(' '));
+  const tokens = (s) => [...new Set(String(s || '').toLowerCase().replace(/https?:\/\/\S+/g, ' ').replace(/[^a-z0-9]+/g, ' ').split(/\s+/).filter(w => w.length > 2 && !stop.has(w)))];
+  const queryTokens = tokens(q);
+  const topicTokens = queryTokens.filter(w => !/^\d+$/.test(w));
+  const score = (item) => {
+    const title = tokens(item.title), body = tokens((item.snippet || '') + ' ' + (item.publisher || item.site || ''));
+    const all = new Set([...title, ...body]);
+    const overlap = topicTokens.filter(w => all.has(w)).length;
+    let points = overlap * 3 + topicTokens.filter(w => title.includes(w)).length * 2;
+    const text = (String(item.title || '') + ' ' + String(item.snippet || '')).toLowerCase();
+    if (intent === 'travel') {
+      if (/\b(dictionary|definition|thesaurus|word meaning|synonym|etymology)\b/i.test(text)) points -= 12;
+      if (/\b(tourism|travel guide|visitor|attraction|museum|transport|metro|airport|official|things to do|hotel|restaurant|opening hours)\b/i.test(text)) points += 3;
+    } else if (intent === 'technical') {
+      if (/\b(dictionary|definition|thesaurus|word meaning)\b/i.test(text)) points -= 10;
+      if (/\b(documentation|github|developer|api|reference|tutorial|release notes|stackoverflow|mozilla)\b/i.test(text)) points += 3;
+    } else if (intent === 'news') {
+      if (/\b(dictionary|definition|thesaurus|word meaning)\b/i.test(text)) points -= 10;
+      if (item.publishedAt) points += 1;
+    }
+    return points;
+  };
   const normalize = (items) => {
     const out = [], seen = new Set();
     for (const item of items) {
@@ -89,16 +115,20 @@ async function webSearch(query) {
         const title = decode(item.title).slice(0, 200);
         const url = new URL(decode(item.url));
         const snippet = decode(item.snippet).slice(0, 700);
-        if (!title || !/^https?:$/.test(url.protocol) || seen.has(url.href)) continue;
-        seen.add(url.href);
+        if (!title || !/^https?:$/.test(url.protocol)) continue;
+        const canonical = url.href.replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase();
+        if (seen.has(canonical)) continue;
+        seen.add(canonical);
         const publisher = decode(item.publisher || item.site || '').slice(0, 100);
         let publisherUrl = ''; try { if (item.publisherUrl) publisherUrl = new URL(decode(item.publisherUrl)).href; } catch {}
         const publishedAt = decode(item.publishedAt || '').slice(0, 80);
-        out.push({ title, url: url.href, snippet, ...(publisher ? { site: publisher } : {}), ...(publisherUrl ? { publisherUrl } : {}), ...(publishedAt ? { publishedAt } : {}) });
-        if (out.length >= 6) break;
+        out.push({ title, url: url.href, snippet, ...(publisher ? { site: publisher } : {}), ...(publisherUrl ? { publisherUrl } : {}), ...(publishedAt ? { publishedAt } : {}), _score: score({ ...item, title, snippet, publisher }) });
       } catch {}
     }
-    return out;
+    // Rank by relevance and refuse results that merely share a generic word.
+    out.sort((a, b) => b._score - a._score);
+    const minScore = intent === 'travel' || intent === 'technical' ? 3 : 2;
+    return out.filter(x => x._score >= minScore).slice(0, 6).map(({ _score, ...x }) => x);
   };
   const get = async (url) => {
     const r = await fetch(url, {
@@ -124,26 +154,32 @@ async function webSearch(query) {
     }
     return normalize(items);
   };
-  const newsIntent = /\b(news|today|latest|breaking|this week|recent|current events|what happened)\b/i.test(q);
-  // For news questions, query Google News first so general search suggestions don't
-  // overwhelm the answer with unrelated pages that happen to match one word.
-  const rssProviders = [];
-  if (newsIntent) rssProviders.push('https://news.google.com/rss/search?q=' + encodeURIComponent(q + ' technology') + '&hl=en-US&gl=US&ceid=US:en');
-  rssProviders.push('https://www.bing.com/search?format=rss&q=' + encodeURIComponent(q));
-  if (!newsIntent) rssProviders.push('https://news.google.com/rss/search?q=' + encodeURIComponent(q) + '&hl=en-US&gl=US&ceid=US:en');
-  for (const endpoint of rssProviders) {
+  // Search with intent-aware terms instead of allowing a single ambiguous keyword
+  // (for example, "plan") to dominate results.
+  const entities = queryTokens.filter(w => !['news','technology','tech','today','latest','breaking','recent','current','happened','show','tell','explain','describe','compare','research','search'].includes(w));
+  const searchQuery = intent === 'travel'
+    ? [entities.join(' '), entities.join(' ') + ' travel attractions official tourism']
+    : intent === 'technical'
+      ? [q, q + ' official documentation developer reference']
+      : intent === 'news'
+        ? [q, q + ' technology news']
+        : [q, entities.join(' ')];
+  const uniqueQueries = [...new Set(searchQuery.map(x => x.trim()).filter(Boolean))];
+  const endpoints = [];
+  if (intent === 'news') for (const query of uniqueQueries) endpoints.push('https://news.google.com/rss/search?q=' + encodeURIComponent(query) + '&hl=en-US&gl=US&ceid=US:en');
+  for (const query of uniqueQueries) endpoints.push('https://www.bing.com/search?format=rss&q=' + encodeURIComponent(query));
+  if (intent !== 'news') for (const query of uniqueQueries) endpoints.push('https://news.google.com/rss/search?q=' + encodeURIComponent(query) + '&hl=en-US&gl=US&ceid=US:en');
+  for (const endpoint of [...new Set(endpoints)]) {
     try {
       const results = parseRss(await get(endpoint));
       if (results.length) return results;
-      console.warn('RSS search provider returned no parseable items.');
+      console.warn('RSS search provider returned no relevant items.');
     } catch (e) {
       console.warn('RSS search provider failed:', e.message);
     }
   }
-  // Fallback to DuckDuckGo, parsing result links globally rather than splitting
-  // on every class containing "result" (which also matches nested result elements).
   try {
-    const html = await get('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q));
+    const html = await get('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(uniqueQueries[0] || q));
     const items = [];
     const linkRe = /<a\b([^>]*class=["'][^"']*\bresult__a\b[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
     for (const m of html.matchAll(linkRe)) {
@@ -160,7 +196,7 @@ async function webSearch(query) {
     }
     const results = normalize(items);
     if (results.length) return results;
-    console.warn('DuckDuckGo returned no parseable results.');
+    console.warn('DuckDuckGo returned no relevant results.');
   } catch (e) {
     console.warn('DuckDuckGo search failed:', e.message);
   }
