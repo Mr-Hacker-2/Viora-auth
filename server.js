@@ -308,7 +308,18 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('Viora auth OK');
   } catch (e) {
-    console.error(e);
-    res.writeHead(500); res.end('Server error');
+    console.error('Request failed:', e?.message || e);
+
+    // A streaming route (such as /api/chat) may already have sent HTTP headers.
+    // Never call writeHead() a second time; close the response safely instead.
+    if (res.headersSent) {
+      if (!res.writableEnded && !res.destroyed) res.end();
+      return;
+    }
+
+    if (!res.destroyed && !res.writableEnded) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8', ...cors() });
+      res.end('Server error');
+    }
   }
 }).listen(process.env.PORT || 3000);
