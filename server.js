@@ -130,9 +130,9 @@ async function webSearch(query) {
     const minScore = intent === 'travel' || intent === 'technical' ? 3 : 2;
     return out.filter(x => x._score >= minScore).slice(0, 6).map(({ _score, ...x }) => x);
   };
-  const get = async (url) => {
+  const get = async (url, timeoutMs = 4500) => {
     const r = await fetch(url, {
-      signal: AbortSignal.timeout(9000),
+      signal: AbortSignal.timeout(timeoutMs),
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36', Accept: 'application/rss+xml,application/xml,text/html;q=0.9,*/*;q=0.8' }
     });
     if (!r.ok) throw new Error('Provider returned ' + r.status);
@@ -169,17 +169,19 @@ async function webSearch(query) {
   if (intent === 'news') for (const query of uniqueQueries) endpoints.push('https://news.google.com/rss/search?q=' + encodeURIComponent(query) + '&hl=en-US&gl=US&ceid=US:en');
   for (const query of uniqueQueries) endpoints.push('https://www.bing.com/search?format=rss&q=' + encodeURIComponent(query));
   if (intent !== 'news') for (const query of uniqueQueries) endpoints.push('https://news.google.com/rss/search?q=' + encodeURIComponent(query) + '&hl=en-US&gl=US&ceid=US:en');
-  for (const endpoint of [...new Set(endpoints)]) {
-    try {
-      const results = parseRss(await get(endpoint));
-      if (results.length) return results;
-      console.warn('RSS search provider returned no relevant items.');
-    } catch (e) {
-      console.warn('RSS search provider failed:', e.message);
-    }
+  // Query the first providers concurrently. Sequential RSS requests made one slow
+  // provider delay every answer, even when another provider had useful results.
+  const primary = [...new Set(endpoints)].slice(0, 3);
+  const batches = await Promise.allSettled(primary.map(async endpoint => parseRss(await get(endpoint, 3500))));
+  const combined = [];
+  for (const batch of batches) {
+    if (batch.status === 'fulfilled') combined.push(...batch.value);
+    else console.warn('RSS search provider failed:', batch.reason?.message || 'unknown error');
   }
+  const ranked = normalize(combined);
+  if (ranked.length) return ranked;
   try {
-    const html = await get('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(uniqueQueries[0] || q));
+    const html = await get('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(uniqueQueries[0] || q), 2500);
     const items = [];
     const linkRe = /<a\b([^>]*class=["'][^"']*\bresult__a\b[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
     for (const m of html.matchAll(linkRe)) {
@@ -238,7 +240,7 @@ async function chat(req, res, user) {
   const modelChain = visionRequested ? ['meta/llama-3.2-11b-vision-instruct', 'meta/llama-3.2-90b-vision-instruct'] : a.chain;
   for (const model of modelChain) {
     r = await fetch(`${NV}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: [{ role: 'system', content: sys }, ...msgs], temperature: a.t, max_tokens: 4096, stream: true }), signal: AbortSignal.timeout(30000) }).catch(() => null);
+      body: JSON.stringify({ model, messages: [{ role: 'system', content: sys }, ...msgs], temperature: a.t, max_tokens: b.assistant === 'flash' ? 2048 : 3072, stream: true }), signal: AbortSignal.timeout(30000) }).catch(() => null);
     if (r && r.ok) break; r = null;
   }
   if (!r) return json(res, 502, { error: 'The AI is busy right now. Please try again in a moment.' });
