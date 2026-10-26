@@ -100,63 +100,65 @@ async function webSearch(query) {
   const get = async (url) => {
     const r = await fetch(url, {
       signal: AbortSignal.timeout(9000),
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VioraSearch/1.0)', Accept: 'text/html,application/rss+xml,application/xml;q=0.9,*/*;q=0.8' }
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36', Accept: 'application/rss+xml,application/xml,text/html;q=0.9,*/*;q=0.8' }
     });
     if (!r.ok) throw new Error('Provider returned ' + r.status);
     return (await r.text()).slice(0, 1500000);
   };
-
-  // Try DuckDuckGo's HTML results first.
-  try {
-    const html = await get('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q));
-    const blocks = html.split(/<div[^>]+class=["'][^"']*result[^"']*["'][^>]*>/i).slice(1);
+  const parseRss = (xml) => {
     const items = [];
-    for (const block of blocks) {
-      const a = block.match(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i)
-        || block.match(/<a[^>]+href=["']([^"']+)["'][^>]+class=["'][^"']*result__a[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
-      if (!a) continue;
-      let href = decode(a[1]);
-      try {
-        const parsed = new URL(href, 'https://html.duckduckgo.com');
-        if (parsed.hostname.endsWith('duckduckgo.com') && parsed.searchParams.has('uddg')) href = parsed.searchParams.get('uddg');
-      } catch {}
-      const sm = block.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/(?:a|td)>/i);
-      items.push({ title: a[2], url: href, snippet: sm?.[1] || '' });
+    for (const m of xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) {
+      const item = m[1];
+      const title = (item.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
+      const url = (item.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1]
+        || (item.match(/<guid[^>]*>([\s\S]*?)<\/guid>/i) || [])[1] || '';
+      const snippet = (item.match(/<description[^>]*>([\s\S]*?)<\/description>/i) || [])[1] || '';
+      items.push({ title, url, snippet });
     }
-    const results = normalize(items);
-    if (results.length) return results;
-    console.warn('DuckDuckGo returned HTML but no parseable results; trying RSS fallback.');
-  } catch (e) {
-    console.warn('DuckDuckGo search failed:', e.message);
-  }
-
-  // RSS fallbacks are less dependent on search-page HTML markup.
-  const providers = [
-    'https://www.bing.com/search?format=rss&q=' + encodeURIComponent(q),
-    'https://news.google.com/rss/search?q=' + encodeURIComponent(q) + '&hl=en-US&gl=US&ceid=US:en'
-  ];
-  for (const endpoint of providers) {
+    return normalize(items);
+  };
+  const newsIntent = /\b(news|today|latest|breaking|this week|recent|current events|what happened)\b/i.test(q);
+  // For news questions, query Google News first so general search suggestions don't
+  // overwhelm the answer with unrelated pages that happen to match one word.
+  const rssProviders = [];
+  if (newsIntent) rssProviders.push('https://news.google.com/rss/search?q=' + encodeURIComponent(q + ' technology') + '&hl=en-US&gl=US&ceid=US:en');
+  rssProviders.push('https://www.bing.com/search?format=rss&q=' + encodeURIComponent(q));
+  if (!newsIntent) rssProviders.push('https://news.google.com/rss/search?q=' + encodeURIComponent(q) + '&hl=en-US&gl=US&ceid=US:en');
+  for (const endpoint of rssProviders) {
     try {
-      const xml = await get(endpoint);
-      const items = [];
-      for (const m of xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) {
-        const item = m[1];
-        const title = (item.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
-        const url = (item.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1]
-          || (item.match(/<guid[^>]*>([\s\S]*?)<\/guid>/i) || [])[1] || '';
-        const snippet = (item.match(/<description[^>]*>([\s\S]*?)<\/description>/i) || [])[1] || '';
-        items.push({ title, url, snippet });
-      }
-      const results = normalize(items);
+      const results = parseRss(await get(endpoint));
       if (results.length) return results;
       console.warn('RSS search provider returned no parseable items.');
     } catch (e) {
       console.warn('RSS search provider failed:', e.message);
     }
   }
+  // Fallback to DuckDuckGo, parsing result links globally rather than splitting
+  // on every class containing "result" (which also matches nested result elements).
+  try {
+    const html = await get('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(q));
+    const items = [];
+    const linkRe = /<a\b([^>]*class=["'][^"']*\bresult__a\b[^"']*["'][^>]*)>([\s\S]*?)<\/a>/gi;
+    for (const m of html.matchAll(linkRe)) {
+      const hrefMatch = m[1].match(/\bhref=["']([^"']+)["']/i);
+      if (!hrefMatch) continue;
+      let href = decode(hrefMatch[1]);
+      try {
+        const parsed = new URL(href, 'https://html.duckduckgo.com');
+        if (parsed.hostname.endsWith('duckduckgo.com') && parsed.searchParams.has('uddg')) href = parsed.searchParams.get('uddg');
+      } catch {}
+      const after = html.slice(m.index + m[0].length, m.index + m[0].length + 1800);
+      const sm = after.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/(?:a|td|div)>/i);
+      items.push({ title: m[2], url: href, snippet: sm?.[1] || '' });
+    }
+    const results = normalize(items);
+    if (results.length) return results;
+    console.warn('DuckDuckGo returned no parseable results.');
+  } catch (e) {
+    console.warn('DuckDuckGo search failed:', e.message);
+  }
   return [];
 }
-
 async function chat(req, res, user) {
   const b = await readBody(req), a = ASSIST[b.assistant];
   if (!a || !Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: 'Bad request.' });
