@@ -83,11 +83,11 @@ async function webSearch(query) {
   });
   if (!response.ok) throw new Error('Search provider returned ' + response.status);
   const html = (await response.text()).slice(0, 1500000), out = [], seen = new Set();
-  const decode = (v) => String(v || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, ' ').replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();
+  const decode = (v) => String(v || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&#x27;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, ' ').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
   const blocks = html.split(/<div[^>]+class=["'][^"']*result[^"']*["'][^>]*>/i).slice(1);
   for (const block of blocks) {
-    const a = block.match(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\\s\\S]*?)<\\/a>/i)
-      || block.match(/<a[^>]+href=["']([^"']+)["'][^>]+class=["'][^"']*result__a[^"']*["'][^>]*>([\\s\\S]*?)<\\/a>/i);
+    const a = block.match(/<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i)
+      || block.match(/<a[^>]+href=["']([^"']+)["'][^>]+class=["'][^"']*result__a[^"']*["'][^>]*>([\s\S]*?)<\/a>/i);
     if (!a) continue;
     try {
       let href = a[1].replace(/&amp;/g, '&');
@@ -96,7 +96,7 @@ async function webSearch(query) {
       const dest = new URL(href);
       if (!/^https?:$/.test(dest.protocol) || seen.has(dest.href)) continue;
       const title = decode(a[2]).slice(0, 200);
-      const sm = block.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\\s\\S]*?)<\\/(?:a|td)>/i);
+      const sm = block.match(/class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/(?:a|td)>/i);
       const snippet = decode(sm?.[1] || '').slice(0, 700);
       if (!title) continue;
       seen.add(dest.href);
@@ -106,7 +106,8 @@ async function webSearch(query) {
   }
   return out;
 }
-\nasync function chat(req, res, user) {
+
+async function chat(req, res, user) {
   const b = await readBody(req), a = ASSIST[b.assistant];
   if (!a || !Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: 'Bad request.' });
   const key = process.env[`NVIDIA_${a.env}_KEY`] || process.env.NVIDIA_API_KEY;
