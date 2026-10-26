@@ -91,7 +91,10 @@ async function webSearch(query) {
         const snippet = decode(item.snippet).slice(0, 700);
         if (!title || !/^https?:$/.test(url.protocol) || seen.has(url.href)) continue;
         seen.add(url.href);
-        out.push({ title, url: url.href, snippet });
+        const publisher = decode(item.publisher || item.site || '').slice(0, 100);
+        let publisherUrl = ''; try { if (item.publisherUrl) publisherUrl = new URL(decode(item.publisherUrl)).href; } catch {}
+        const publishedAt = decode(item.publishedAt || '').slice(0, 80);
+        out.push({ title, url: url.href, snippet, ...(publisher ? { site: publisher } : {}), ...(publisherUrl ? { publisherUrl } : {}), ...(publishedAt ? { publishedAt } : {}) });
         if (out.length >= 6) break;
       } catch {}
     }
@@ -113,7 +116,11 @@ async function webSearch(query) {
       const url = (item.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1]
         || (item.match(/<guid[^>]*>([\s\S]*?)<\/guid>/i) || [])[1] || '';
       const snippet = (item.match(/<description[^>]*>([\s\S]*?)<\/description>/i) || [])[1] || '';
-      items.push({ title, url, snippet });
+      const sourceMatch = item.match(/<source\b([^>]*)>([\s\S]*?)<\/source>/i);
+      const publisher = sourceMatch ? sourceMatch[2] : '';
+      const publisherUrl = sourceMatch ? ((sourceMatch[1].match(/\burl=["']([^"']+)["']/i) || [])[1] || '') : '';
+      const publishedAt = (item.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i) || [])[1] || '';
+      items.push({ title, url, snippet, publisher, publisherUrl, publishedAt });
     }
     return normalize(items);
   };
