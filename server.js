@@ -279,7 +279,7 @@ async function chat(req, res, user) {
         break;
       }
       lastProviderStatus = attempt.status;
-      const detail = (await attempt.text().catch(() => '')).slice(0, 500).replace(/[\\r\\n]+/g, ' ');
+      const detail = (await attempt.text().catch(() => '')).slice(0, 500).replace(/[\r\n]+/g, ' ');
       console.warn(`AI model ${model} returned HTTP ${attempt.status}${detail ? ': ' + detail : ''}`);
     } catch (e) {
       console.warn(`AI model ${model} failed: ${e?.name || 'Error'}${e?.message ? ' — ' + e.message : ''}`);
