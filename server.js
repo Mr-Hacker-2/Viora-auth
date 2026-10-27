@@ -248,17 +248,69 @@ async function chat(req, res, user) {
     }
   }
   let r = null;
-  const modelChain = visionRequested ? ['meta/llama-3.2-11b-vision-instruct', 'meta/llama-3.2-90b-vision-instruct'] : a.chain;
+  const modelChain = visionRequested
+    ? ['meta/llama-3.2-11b-vision-instruct', 'meta/llama-3.2-90b-vision-instruct']
+    : [...new Set(a.chain)];
+  let lastProviderStatus = 0;
+  let clientGone = false;
+  const markClientGone = () => { if (!res.writableEnded) clientGone = true; };
+  res.once('close', markClientGone);
+
+  // Keep fallback attempts bounded: a slow first model must not make every
+  // subsequent model wait another full 30 seconds.
   for (const model of modelChain) {
-    r = await fetch(`${NV}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: [{ role: 'system', content: sys }, ...msgs], temperature: a.t, max_tokens: b.assistant === 'flash' ? 2048 : 3072, stream: true }), signal: AbortSignal.timeout(30000) }).catch(() => null);
-    if (r && r.ok) break; r = null;
+    if (clientGone || req.destroyed) break;
+    try {
+      const attempt = await fetch(`${NV}/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'system', content: sys }, ...msgs],
+          temperature: a.t,
+          max_tokens: b.assistant === 'flash' ? 2048 : 3072,
+          stream: true
+        }),
+        signal: AbortSignal.timeout(12000)
+      });
+      if (attempt.ok && attempt.body) {
+        r = attempt;
+        console.info(`AI provider selected: ${model}`);
+        break;
+      }
+      lastProviderStatus = attempt.status;
+      const detail = (await attempt.text().catch(() => '')).slice(0, 500).replace(/[\\r\\n]+/g, ' ');
+      console.warn(`AI model ${model} returned HTTP ${attempt.status}${detail ? ': ' + detail : ''}`);
+    } catch (e) {
+      console.warn(`AI model ${model} failed: ${e?.name || 'Error'}${e?.message ? ' — ' + e.message : ''}`);
+    }
   }
-  if (!r) return json(res, 502, { error: 'The AI is busy right now. Please try again in a moment.' });
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...cors() });
+  res.removeListener('close', markClientGone);
+  if (clientGone || req.destroyed) return;
+  if (!r) {
+    const message = lastProviderStatus === 401 || lastProviderStatus === 403
+      ? 'The AI provider rejected the server key or model access. Please contact the site owner.'
+      : 'All available AI models failed or timed out. Please retry in a moment.';
+    return json(res, 502, { error: message });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',
+    ...cors()
+  });
   if (b.web === true) res.write('data: ' + JSON.stringify({ viora_sources: sources }) + '\n\n');
-  for await (const c of r.body) res.write(c);
-  res.end();
+  try {
+    for await (const c of r.body) {
+      if (res.destroyed || clientGone) break;
+      if (!res.write(c)) await new Promise((resolve) => res.once('drain', resolve));
+    }
+    if (!res.destroyed && !res.writableEnded) res.end();
+  } catch (e) {
+    console.error('AI stream failed:', e?.message || e);
+    if (!res.destroyed && !res.writableEnded) res.end();
+  }
 }
 
 http.createServer(async (req, res) => {
