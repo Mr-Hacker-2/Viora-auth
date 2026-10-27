@@ -208,20 +208,26 @@ async function webSearch(query) {
   return [];
 }
 async function chat(req, res, user) {
-  const b = await readBody(req, 12e6), a = ASSIST[b.assistant];
+  const b = await readBody(req, 16e6), a = ASSIST[b.assistant];
   if (!a || !Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: 'Bad request.' });
   const key = process.env[`NVIDIA_${a.env}_KEY`] || process.env.NVIDIA_API_KEY;
   if (!key) return json(res, 500, { error: `The ${b.assistant} assistant has no API key on the server yet.` });
   const imageInputs = Array.isArray(b.images)
     ? b.images.filter((x) => typeof x === 'string' && /^data:image\/(?:jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=]+$/i.test(x) && x.length <= 5_000_000).slice(0, 8)
     : [];
+  const videoInput = typeof b.video === 'string' && /^data:video\/mp4;base64,[A-Za-z0-9+/=]+$/i.test(b.video) && b.video.length <= 6_000_000
+    ? b.video
+    : null;
+  if (b.video && !videoInput) return json(res, 413, { error: 'The native video upload is too large or invalid. Try a shorter MP4 clip, or attach a video that Viora can sample into frames.' });
+  const videoRequested = !!videoInput;
   const visionRequested = imageInputs.length > 0;
   const msgs = b.messages.slice(-24).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, 20000) }));
-  if (visionRequested) {
+  if (visionRequested || videoRequested) {
     const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
     if (lastUser) {
       lastUser.content = [
-        { type: 'text', text: String(lastUser.content || 'Please describe and analyze the attached image(s).') },
+        { type: 'text', text: String(lastUser.content || (videoRequested ? 'Please understand and summarize the attached video.' : 'Please describe and analyze the attached image(s).')) },
+        ...(videoRequested ? [{ type: 'video_url', video_url: { url: videoInput } }] : []),
         ...imageInputs.map((url) => ({ type: 'image_url', image_url: { url } }))
       ];
     }
@@ -229,6 +235,9 @@ async function chat(req, res, user) {
   let sys = a.sys;
   if (visionRequested) {
     sys += '\n\nIMAGE UNDERSTANDING REQUIRED: The latest user message contains one or more attached images. Inspect the actual visual content before answering. For a question like “What is this?”, identify the most likely visible object or scene, describe the visual evidence briefly, and state uncertainty only where the image genuinely does not support a confident identification. Do not ask the user to clarify merely because they wrote “this”; that refers to the attached image. Never claim you cannot see the image when image data is present. If text is visible, read it when relevant. Do not invent brand, model, or details that are not visible.';
+  }
+  if (videoRequested) {
+    sys += '\n\nNATIVE VIDEO UNDERSTANDING REQUIRED: Analyze the actual attached MP4 video, including its temporal sequence and audible audio when present. Answer questions about actions, changes over time, and speech/sounds only when supported by the video/audio. Distinguish what is directly observed from inference, and never invent events or dialogue. The clip is expected to be no longer than two minutes.';
   }
   // Apply Viora's user-selected response style and task guidance, capped in size.
   // This is user preference text, not trusted system policy or attachment content.
@@ -248,17 +257,72 @@ async function chat(req, res, user) {
     }
   }
   let r = null;
-  const modelChain = visionRequested ? ['meta/llama-3.2-11b-vision-instruct', 'meta/llama-3.2-90b-vision-instruct'] : a.chain;
+  const modelChain = videoRequested
+    ? ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', 'nvidia/nemotron-3_5-super-vl-120b-a12b']
+    : visionRequested
+      ? ['meta/llama-3.2-11b-vision-instruct', 'meta/llama-3.2-90b-vision-instruct']
+      : [...new Set(a.chain)];
+  let lastProviderStatus = 0;
+  let clientGone = false;
+  const markClientGone = () => { if (!res.writableEnded) clientGone = true; };
+  res.once('close', markClientGone);
+
+  // Keep fallback attempts bounded: a slow first model must not make every
+  // subsequent model wait another full 30 seconds.
   for (const model of modelChain) {
-    r = await fetch(`${NV}/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: [{ role: 'system', content: sys }, ...msgs], temperature: a.t, max_tokens: b.assistant === 'flash' ? 2048 : 3072, stream: true }), signal: AbortSignal.timeout(30000) }).catch(() => null);
-    if (r && r.ok) break; r = null;
+    if (clientGone || req.destroyed) break;
+    try {
+      const attempt = await fetch(`${NV}/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'system', content: sys }, ...msgs],
+          temperature: a.t,
+          max_tokens: videoRequested ? 2048 : b.assistant === 'flash' ? 2048 : 3072,
+          ...(videoRequested ? { chat_template_kwargs: { enable_thinking: false }, mm_processor_kwargs: { use_audio_in_video: true } } : {}),
+          stream: true
+        }),
+        signal: AbortSignal.timeout(12000)
+      });
+      if (attempt.ok && attempt.body) {
+        r = attempt;
+        console.info(`AI provider selected: ${model}`);
+        break;
+      }
+      lastProviderStatus = attempt.status;
+      const detail = (await attempt.text().catch(() => '')).slice(0, 500).replace(/[\r\n]+/g, ' ');
+      console.warn(`AI model ${model} returned HTTP ${attempt.status}${detail ? ': ' + detail : ''}`);
+    } catch (e) {
+      console.warn(`AI model ${model} failed: ${e?.name || 'Error'}${e?.message ? ' — ' + e.message : ''}`);
+    }
   }
-  if (!r) return json(res, 502, { error: 'The AI is busy right now. Please try again in a moment.' });
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...cors() });
+  res.removeListener('close', markClientGone);
+  if (clientGone || req.destroyed) return;
+  if (!r) {
+    const message = lastProviderStatus === 401 || lastProviderStatus === 403
+      ? 'The AI provider rejected the server key or model access. Please contact the site owner.'
+      : 'All available AI models failed or timed out. Please retry in a moment.';
+    return json(res, 502, { error: message });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',
+    ...cors()
+  });
   if (b.web === true) res.write('data: ' + JSON.stringify({ viora_sources: sources }) + '\n\n');
-  for await (const c of r.body) res.write(c);
-  res.end();
+  try {
+    for await (const c of r.body) {
+      if (res.destroyed || clientGone) break;
+      if (!res.write(c)) await new Promise((resolve) => res.once('drain', resolve));
+    }
+    if (!res.destroyed && !res.writableEnded) res.end();
+  } catch (e) {
+    console.error('AI stream failed:', e?.message || e);
+    if (!res.destroyed && !res.writableEnded) res.end();
+  }
 }
 
 http.createServer(async (req, res) => {
