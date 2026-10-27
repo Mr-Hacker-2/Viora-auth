@@ -215,13 +215,19 @@ async function chat(req, res, user) {
   const imageInputs = Array.isArray(b.images)
     ? b.images.filter((x) => typeof x === 'string' && /^data:image\/(?:jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=]+$/i.test(x) && x.length <= 5_000_000).slice(0, 8)
     : [];
+  const videoInput = typeof b.video === 'string' && /^data:video\/mp4;base64,[A-Za-z0-9+/=]+$/i.test(b.video) && b.video.length <= 6_000_000
+    ? b.video
+    : null;
+  if (b.video && !videoInput) return json(res, 413, { error: 'The native video upload is too large or invalid. Try a shorter MP4 clip, or attach a video that Viora can sample into frames.' });
+  const videoRequested = !!videoInput;
   const visionRequested = imageInputs.length > 0;
   const msgs = b.messages.slice(-24).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, 20000) }));
-  if (visionRequested) {
+  if (visionRequested || videoRequested) {
     const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
     if (lastUser) {
       lastUser.content = [
-        { type: 'text', text: String(lastUser.content || 'Please describe and analyze the attached image(s).') },
+        { type: 'text', text: String(lastUser.content || (videoRequested ? 'Please understand and summarize the attached video.' : 'Please describe and analyze the attached image(s).')) },
+        ...(videoRequested ? [{ type: 'video_url', video_url: { url: videoInput } }] : []),
         ...imageInputs.map((url) => ({ type: 'image_url', image_url: { url } }))
       ];
     }
@@ -229,6 +235,9 @@ async function chat(req, res, user) {
   let sys = a.sys;
   if (visionRequested) {
     sys += '\n\nIMAGE UNDERSTANDING REQUIRED: The latest user message contains one or more attached images. Inspect the actual visual content before answering. For a question like “What is this?”, identify the most likely visible object or scene, describe the visual evidence briefly, and state uncertainty only where the image genuinely does not support a confident identification. Do not ask the user to clarify merely because they wrote “this”; that refers to the attached image. Never claim you cannot see the image when image data is present. If text is visible, read it when relevant. Do not invent brand, model, or details that are not visible.';
+  }
+  if (videoRequested) {
+    sys += '\n\nNATIVE VIDEO UNDERSTANDING REQUIRED: Analyze the actual attached MP4 video, including its temporal sequence and audible audio when present. Answer questions about actions, changes over time, and speech/sounds only when supported by the video/audio. Distinguish what is directly observed from inference, and never invent events or dialogue. The clip is expected to be no longer than two minutes.';
   }
   // Apply Viora's user-selected response style and task guidance, capped in size.
   // This is user preference text, not trusted system policy or attachment content.
@@ -248,9 +257,11 @@ async function chat(req, res, user) {
     }
   }
   let r = null;
-  const modelChain = visionRequested
-    ? ['meta/llama-3.2-11b-vision-instruct', 'meta/llama-3.2-90b-vision-instruct']
-    : [...new Set(a.chain)];
+  const modelChain = videoRequested
+    ? ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', 'nvidia/nemotron-3_5-super-vl-120b-a12b']
+    : visionRequested
+      ? ['meta/llama-3.2-11b-vision-instruct', 'meta/llama-3.2-90b-vision-instruct']
+      : [...new Set(a.chain)];
   let lastProviderStatus = 0;
   let clientGone = false;
   const markClientGone = () => { if (!res.writableEnded) clientGone = true; };
@@ -268,7 +279,8 @@ async function chat(req, res, user) {
           model,
           messages: [{ role: 'system', content: sys }, ...msgs],
           temperature: a.t,
-          max_tokens: b.assistant === 'flash' ? 2048 : 3072,
+          max_tokens: videoRequested ? 2048 : b.assistant === 'flash' ? 2048 : 3072,
+          ...(videoRequested ? { chat_template_kwargs: { enable_thinking: false }, mm_processor_kwargs: { use_audio_in_video: true } } : {}),
           stream: true
         }),
         signal: AbortSignal.timeout(12000)
