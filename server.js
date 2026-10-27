@@ -208,7 +208,7 @@ async function webSearch(query) {
   return [];
 }
 async function chat(req, res, user) {
-  const b = await readBody(req, 12e6), a = ASSIST[b.assistant];
+  const b = await readBody(req, 16e6), a = ASSIST[b.assistant];
   if (!a || !Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: 'Bad request.' });
   const key = process.env[`NVIDIA_${a.env}_KEY`] || process.env.NVIDIA_API_KEY;
   if (!key) return json(res, 500, { error: `The ${b.assistant} assistant has no API key on the server yet.` });
