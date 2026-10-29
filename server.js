@@ -270,11 +270,15 @@ async function chat(req, res, user) {
     searchMs = Date.now() - searchStartedAt;
     if (sources.length) {
       const fetchStartedAt = Date.now();
+      const thoroughResearch = b.assistant === 'search';
+      const pageFetchLimit = thoroughResearch ? 4 : 3;
+      const pageCharLimit = thoroughResearch ? 5000 : 3000;
+      const pageTimeoutMs = thoroughResearch ? 4500 : 3000;
       sources = await Promise.all(sources.map(async (source, index) => {
-        if (index >= 4) return { ...source, pageFetched: false };
+        if (index >= pageFetchLimit) return { ...source, pageFetched: false };
         try {
-          const page = textOf(await safeFetch(source.url, 0, 4500));
-          const pageText = page.text.slice(0, 5000);
+          const page = textOf(await safeFetch(source.url, 0, pageTimeoutMs));
+          const pageText = page.text.slice(0, pageCharLimit);
           if (!pageText) return { ...source, pageFetched: false };
           fetchedPages++;
           return { ...source, title: page.title || source.title, pageFetched: true, _pageText: pageText };
