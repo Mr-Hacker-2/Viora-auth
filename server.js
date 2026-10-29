@@ -219,15 +219,21 @@ async function chat(req, res, user) {
     ? b.video
     : null;
   if (b.video && !videoInput) return json(res, 413, { error: 'The native video upload is too large or invalid. Try a shorter MP4 clip, or attach a video that Viora can sample into frames.' });
+  const audioInput = typeof b.audio === 'string' && /^data:audio\/(?:wav|mpeg|flac);base64,[A-Za-z0-9+/=]+$/i.test(b.audio) && b.audio.length <= 6_000_000
+    ? b.audio
+    : null;
+  if (b.audio && !audioInput) return json(res, 413, { error: 'The audio upload is too large or invalid. Use a WAV, MP3, or FLAC file under 4 MB.' });
   const videoRequested = !!videoInput;
+  const audioRequested = !!audioInput;
   const visionRequested = imageInputs.length > 0;
   const msgs = b.messages.slice(-24).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, 20000) }));
-  if (visionRequested || videoRequested) {
+  if (visionRequested || videoRequested || audioRequested) {
     const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
     if (lastUser) {
       lastUser.content = [
-        { type: 'text', text: String(lastUser.content || (videoRequested ? 'Please understand and summarize the attached video.' : 'Please describe and analyze the attached image(s).')) },
+        { type: 'text', text: String(lastUser.content || (videoRequested ? 'Please understand and summarize the attached video.' : audioRequested ? 'Please transcribe and summarize the attached audio.' : 'Please describe and analyze the attached image(s).')) },
         ...(videoRequested ? [{ type: 'video_url', video_url: { url: videoInput } }] : []),
+        ...(audioRequested ? [{ type: 'audio_url', audio_url: { url: audioInput } }] : []),
         ...imageInputs.map((url) => ({ type: 'image_url', image_url: { url } }))
       ];
     }
@@ -238,6 +244,9 @@ async function chat(req, res, user) {
   }
   if (videoRequested) {
     sys += '\n\nNATIVE VIDEO UNDERSTANDING REQUIRED: Analyze the actual attached MP4 video, including its temporal sequence and audible audio when present. Answer questions about actions, changes over time, and speech/sounds only when supported by the video/audio. Distinguish what is directly observed from inference, and never invent events or dialogue. The clip is expected to be no longer than two minutes.';
+  }
+  if (audioRequested) {
+    sys += '\n\nAUDIO UNDERSTANDING REQUIRED: Listen to the attached audio, transcribe speech when asked, and summarize or answer questions only from what is audible. Identify uncertainty for unclear speech and do not infer speakers, words, or sounds that are not supported by the recording.';
   }
   // Apply Viora's user-selected response style and task guidance, capped in size.
   // This is user preference text, not trusted system policy or attachment content.
@@ -290,10 +299,11 @@ async function chat(req, res, user) {
     }
   }
   let r = null;
-  const modelChain = videoRequested
-    ? ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', 'nvidia/nemotron-3_5-super-vl-120b-a12b']
+  const omni = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning';
+  const modelChain = videoRequested || audioRequested
+    ? [omni]
     : visionRequested
-      ? ['meta/llama-3.2-11b-vision-instruct', 'meta/llama-3.2-90b-vision-instruct']
+      ? [omni, 'meta/llama-3.2-90b-vision-instruct']
       : [...new Set(a.chain)];
   let lastProviderStatus = 0;
   let clientGone = false;
@@ -312,8 +322,9 @@ async function chat(req, res, user) {
           model,
           messages: [{ role: 'system', content: sys }, ...msgs],
           temperature: a.t,
-          max_tokens: videoRequested ? 2048 : b.assistant === 'flash' ? 2048 : 3072,
-          ...(videoRequested ? { chat_template_kwargs: { enable_thinking: false }, mm_processor_kwargs: { use_audio_in_video: true } } : {}),
+          max_tokens: videoRequested || audioRequested ? 3072 : b.assistant === 'flash' ? 2048 : 3072,
+          ...(videoRequested || audioRequested || visionRequested ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+          ...(videoRequested ? { mm_processor_kwargs: { use_audio_in_video: true } } : {}),
           stream: true
         }),
         signal: AbortSignal.timeout(12000)
