@@ -327,7 +327,7 @@ async function chat(req, res, user) {
           ...(videoRequested ? { mm_processor_kwargs: { use_audio_in_video: true } } : {}),
           stream: true
         }),
-        signal: AbortSignal.timeout(12000)
+        signal: AbortSignal.timeout(videoRequested || audioRequested || visionRequested ? 45000 : 12000)
       });
       if (attempt.ok && attempt.body) {
         r = attempt;
