@@ -319,20 +319,33 @@ async function chat(req, res, user) {
   for (const model of modelChain) {
     if (clientGone) break;
     try {
-      const attempt = await fetch(`${NV}/chat/completions`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: 'system', content: sys }, ...msgs],
-          temperature: a.t,
-          max_tokens: videoRequested || audioRequested ? 3072 : b.assistant === 'flash' ? 2048 : 3072,
-          ...(videoRequested || audioRequested || visionRequested ? { chat_template_kwargs: { enable_thinking: false } } : {}),
-          ...(videoRequested ? { mm_processor_kwargs: { use_audio_in_video: true } } : {}),
-          stream: true
-        }),
-        signal: AbortSignal.timeout(videoRequested || audioRequested || visionRequested ? 45000 : 12000)
-      });
+      // Bound time to provider headers, then let the frontend's stream-stall
+      // timeout govern generation. AbortSignal.timeout() on fetch also aborts
+      // the response body, which can cut off an otherwise healthy long answer.
+      const providerCtl = new AbortController();
+      const providerTimer = setTimeout(
+        () => providerCtl.abort(),
+        videoRequested || audioRequested || visionRequested ? 45000 : 12000
+      );
+      let attempt;
+      try {
+        attempt = await fetch(`${NV}/chat/completions`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: 'system', content: sys }, ...msgs],
+            temperature: a.t,
+            max_tokens: videoRequested || audioRequested ? 3072 : b.assistant === 'flash' ? 2048 : 3072,
+            ...(videoRequested || audioRequested || visionRequested ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+            ...(videoRequested ? { mm_processor_kwargs: { use_audio_in_video: true } } : {}),
+            stream: true
+          }),
+          signal: providerCtl.signal
+        });
+      } finally {
+        clearTimeout(providerTimer);
+      }
       if (attempt.ok && attempt.body) {
         r = attempt;
         console.info(`AI provider selected: ${model}`);
