@@ -493,6 +493,8 @@ async function chat(req, res, user) {
             { role: 'user', content: 'Review the previous draft for correctness, completeness, and relevance. Correct any material errors or omissions. Use the supplied source records for factual claims when present. Return only the improved final answer.' }
           ];
           let repaired = null;
+          const repairCtl = new AbortController();
+          const repairTimer = setTimeout(() => repairCtl.abort(), 12000);
           try {
             repaired = await fetch(`${NV}/chat/completions`, {
               method: 'POST',
@@ -504,9 +506,10 @@ async function chat(req, res, user) {
                 max_tokens: b.assistant === 'flash' ? 2048 : 3072,
                 stream: true
               }),
-              signal: AbortSignal.timeout(12000)
+              signal: repairCtl.signal
             });
           } catch (error) { console.warn('AI quality retry failed:', error?.message || error); }
+          finally { clearTimeout(repairTimer); }
           if (repaired?.ok && repaired.body && !res.destroyed) {
             await write('data: ' + JSON.stringify({ viora_retry: { model: retryModel } }) + '\n\n');
             for await (const chunk of repaired.body) {
@@ -521,7 +524,7 @@ async function chat(req, res, user) {
       await write('data: ' + JSON.stringify({ viora_quality: { reviewed: true, retried: review.retry } }) + '\n\n');
     }
     if (!res.destroyed && !res.writableEnded) {
-      if (!firstDone) await write('data: [DONE]\n\n');
+      await write('data: [DONE]\n\n');
       res.end();
     }
   } catch (e) {
