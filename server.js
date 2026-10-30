@@ -215,7 +215,7 @@ async function reviewAnswer(key, question, draft, sources = []) {
     pageText: String(s._pageText || '').slice(0, 2500)
   }));
   const reviewInput = JSON.stringify({
-    question: String(question || '').slice(0, 5000),
+    question: (typeof question === 'string' ? question : JSON.stringify(question || [])).slice(0, 9000),
     draft: String(draft || '').slice(0, 12000),
     sources: evidence
   });
@@ -243,7 +243,7 @@ async function reviewAnswer(key, question, draft, sources = []) {
     const parsed = JSON.parse(match[0]);
     const score = Number(parsed.score);
     if (!Number.isFinite(score)) return null;
-    return { score: Math.max(0, Math.min(10, score)), retry: score <= 5 && parsed.retry === true };
+    return { score: Math.max(0, Math.min(10, score)), retry: score <= 5 };
   } catch (error) {
     console.warn('AI answer review unavailable:', error?.message || error);
     return null;
@@ -478,14 +478,14 @@ async function chat(req, res, user) {
 
     let review = null;
     if (draft.trim()) {
-      const question = [...msgs].reverse().find(m => m.role === 'user')?.content;
-      review = await reviewAnswer(key, typeof question === 'string' ? question : '', draft, sources);
+      const questionContext = msgs.slice(-8).map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content.slice(0, 3000) : '[multimodal content]' }));
+      review = await reviewAnswer(key, questionContext, draft, sources);
     }
     if (res.destroyed || clientGone) return;
 
     if (review) {
       if (review.retry) {
-        const retryModel = modelChain.find(model => model !== selectedModel);
+        const retryModel = modelChain.slice(Math.max(0, modelChain.indexOf(selectedModel)) + 1).find(model => model !== selectedModel);
         if (retryModel) {
           const repairMessages = [
             ...msgs,
