@@ -22,3 +22,19 @@ and the answers to the 5 sign-up questions (`profile.js`). Only the fixed option
 - `GET /api/profile` → `{ questions, onboarded, answers }` (Bearer token)
 - `POST /api/profile` with `{ answers }` → validates and saves the answers (Bearer token)
 - `/api/chat` adds the saved answers to the AI's system prompt as background about the user
+- `GET /api/progress?id=<request-id>` → short-lived research status for the authenticated owner of a chat request (Bearer token); no token is placed in the URL
+
+## Pro Search
+
+The chat route accepts `researchMode: "quick" | "deep"` and an optional opaque `researchRequestId`.
+Quick Search runs one bounded provider pass and reads up to four pages. Deep Research runs up to three
+focused searches in parallel, deduplicates and ranks up to ten results, then attempts to read up to six
+pages. Provider/page-fetch progress is stored in memory for at most two minutes and scoped to the
+authenticated user. Disconnecting the chat aborts active search, page retrieval, and model requests.
+The response includes short retrieved-page excerpts for expandable source previews; provider page
+text remains bounded before it is sent to the model or returned to the browser.
+
+Ranking combines topic overlap with modest government/academic/documentation domain hints. It is a
+search heuristic, not a source-quality judgment. Citation numbers are tied to returned sources, but
+the API does not independently verify each claim against the cited page. Do not report claim-level
+fact verification as complete.
