@@ -457,8 +457,8 @@ async function chat(req, res, user) {
           body: JSON.stringify({
             model,
             messages: [{ role: 'system', content: sys }, ...msgs],
-            temperature: a.t,
-            max_tokens: videoRequested || audioRequested ? 3072 : b.assistant === 'flash' ? 2048 : 3072,
+            temperature: Number.isFinite(b.temperature) ? Math.max(0, Math.min(2, b.temperature)) : a.t,
+            max_tokens: Number.isInteger(b.max_tokens) ? Math.max(16, Math.min(3072, b.max_tokens)) : (videoRequested || audioRequested ? 3072 : b.assistant === 'flash' ? 2048 : 3072),
             ...(videoRequested || audioRequested || visionRequested ? { chat_template_kwargs: { enable_thinking: false } } : {}),
             ...(videoRequested ? { mm_processor_kwargs: { use_audio_in_video: true } } : {}),
             stream: true
