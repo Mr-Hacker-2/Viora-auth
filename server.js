@@ -131,6 +131,9 @@ async function readAdminUsers(maxRecords = 2000) {
   return { rows, truncated };
 }
 async function handleAdminPasswordLogin(req, res) {
+  if (!SITE) return json(res, 503, { error: 'Admin password sign-in requires SITE_URL to be configured.' });
+  const origin = req.headers.origin;
+  if (origin && origin !== SITE) return json(res, 403, { error: 'Sign in from the Viora website.' });
   const ip = req.socket?.remoteAddress || 'unknown';
   const now = Date.now();
   const attempts = (adminLoginAttempts.get(ip) || []).filter(at => now - at < 15 * 60e3);
@@ -150,7 +153,7 @@ async function handleAdminPasswordLogin(req, res) {
   const supplied = Buffer.from(String(body.password || ''), 'utf8');
   const expected = Buffer.from(ADMIN_ACCESS_PASSWORD, 'utf8');
   const valid = supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
-  if (!valid) return json(res, 401, { error: 'Incorrect administrator password.' });
+  if (!valid) { await writeAdminAudit('unknown', 'admin_password_login', 'admin', 'denied'); return json(res, 401, { error: 'Incorrect administrator password.' }); }
   const email = [...ADMIN_EMAILS][0];
   const expiresAt = Date.now() + 12 * 60 * 60e3;
   const token = sign({ email, name: 'Viora Administrator', exp: expiresAt });
