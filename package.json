@@ -2,6 +2,11 @@
   "name": "viora-auth",
   "version": "1.0.0",
   "type": "module",
-  "scripts": { "start": "node server.js", "test": "node --test tests/*.test.js" },
-  "engines": { "node": ">=18" }
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/*.test.mjs tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }
