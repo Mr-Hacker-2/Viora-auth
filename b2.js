@@ -23,7 +23,10 @@ async function request(method, key, body, queryParams = null) {
   const host = new URL(ENDPOINT).host;
   const objectParts = key ? key.split('/') : [];
   const path = '/' + [B2_BUCKET, ...objectParts].map(awsEncode).join('/');
-  const query = queryParams ? [...queryParams.entries()].map(([k, v]) => [awsEncode(k), awsEncode(v)]).sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1])).map(([k, v]) => k + '=' + v).join('&') : '';
+  const query = queryParams ? [...queryParams.entries()]
+    .map(([k, v]) => [awsEncode(k), awsEncode(v)])
+    .sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)
+    .map(([k, v]) => k + '=' + v).join('&') : '';
   const payload = body == null ? '' : body;
   const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
   const day = amzDate.slice(0, 8);
@@ -31,9 +34,23 @@ async function request(method, key, body, queryParams = null) {
   const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
   const canonical = [
     method, path, query,
-    `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`,
+    'host:' + host + '\nx-amz-content-sha256:' + payloadHash + '\nx-amz-date:' + amzDate + '\n',
     signedHeaders, payloadHash
   ].join('\n');
+  const scope = day + '/' + REGION + '/s3/aws4_request';
+  const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256(canonical)].join('\n');
+  const signingKey = hmac(hmac(hmac(hmac('AWS4' + B2_APP_KEY, day), REGION), 's3'), 'aws4_request');
+  const signature = crypto.createHmac('sha256', signingKey).update(toSign).digest('hex');
+  const headers = {
+    'x-amz-date': amzDate,
+    'x-amz-content-sha256': payloadHash,
+    Authorization: 'AWS4-HMAC-SHA256 Credential=' + B2_KEY_ID + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature
+  };
+  if (method === 'PUT') headers['Content-Type'] = 'application/json';
+  const url = ENDPOINT + path + (query ? '?' + query : '');
+  return fetch(url, { method, headers, body: method === 'PUT' ? payload : undefined, signal: AbortSignal.timeout(10000) });
+}
+
 /** Read a JSON object. Returns null when it does not exist yet. */
 export async function getJson(key) {
   const r = await request('GET', key);
@@ -59,10 +76,10 @@ export async function listKeys(prefix = '', continuationToken = '', maxKeys = 10
   if (prefix) params.set('prefix', prefix);
   if (continuationToken) params.set('continuation-token', continuationToken);
   const r = await request('GET', '', null, params);
-  if (!r.ok) throw new Error(`B2 LIST ${r.status}`);
+  if (!r.ok) throw new Error('B2 LIST ' + r.status);
   const xml = await r.text();
   const unxml = value => value.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
-  const keys = [...xml.matchAll(/<Key>([\\s\\S]*?)<\\/Key>/g)].map(match => unxml(match[1]));
-  const next = xml.match(/<NextContinuationToken>([\\s\\S]*?)<\\/NextContinuationToken>/);
-  return { keys, truncated: /<IsTruncated>true<\\/IsTruncated>/i.test(xml), nextToken: next ? unxml(next[1]) : '' };
+  const keys = [...xml.matchAll(/<Key>([\s\S]*?)<\/Key>/g)].map(match => unxml(match[1]));
+  const next = xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/);
+  return { keys, truncated: /<IsTruncated>true<\/IsTruncated>/i.test(xml), nextToken: next ? unxml(next[1]) : '' };
 }

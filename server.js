@@ -179,7 +179,7 @@ async function handleAdmin(req, res, u) {
     try { body = await readBody(req, 5000); }
     catch { return json(res, 400, { error: 'Invalid request body.' }); }
     const email = normEmail(body.email), role = body.role;
-    if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) || !['admin', 'user'].includes(role)) return json(res, 400, { error: 'A valid email and supported role are required.' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !['admin', 'user'].includes(role)) return json(res, 400, { error: 'A valid email and supported role are required.' });
     if (ADMIN_EMAILS.has(email)) return json(res, 409, { error: 'This administrator is managed by the server environment.' });
     if (email === actor && role !== 'admin') return json(res, 409, { error: 'You cannot remove your own administrator role.' });
     if (!b2Ready()) return json(res, 503, { error: 'Account storage is not configured.' });
