@@ -31,7 +31,8 @@ const unsign = (t) => {
 };
 // Send the result back to the extension (ext) or to the website (site mode).
 const back = (res, st, params) => {
-  const loc = st.site ? `${SITE}/login.html#` + new URLSearchParams(params) : `https://${st.ext}.chromiumapp.org/?` + new URLSearchParams(params);
+  const sitePath = st.returnTo === 'admin' ? '/admin/' : '/login.html';
+  const loc = st.site ? `${SITE}${sitePath}#` + new URLSearchParams(params) : `https://${st.ext}.chromiumapp.org/?` + new URLSearchParams(params);
   res.writeHead(302, { Location: loc });
   res.end();
 };
@@ -673,7 +674,8 @@ http.createServer(async (req, res) => {
       if (site && !SITE) { res.writeHead(500); return res.end('SITE_URL is not set on the server'); }
       if (!site && !ALLOWED_EXT.includes(ext)) { res.writeHead(400); return res.end('Unknown extension'); }
       const mode = u.searchParams.get('mode') === 'signup' ? 'signup' : 'signin';
-      const state = sign({ ext, site, mode, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
+      const returnTo = site && u.searchParams.get('return') === 'admin' ? 'admin' : 'login';
+      const state = sign({ ext, site, mode, returnTo, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
       res.writeHead(302, {
         Location: 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
           client_id: GOOGLE_CLIENT_ID, redirect_uri: REDIRECT, response_type: 'code',
@@ -755,3 +757,4 @@ http.createServer(async (req, res) => {
     }
   }
 }).listen(process.env.PORT || 3000);
+
