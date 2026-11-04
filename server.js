@@ -306,7 +306,7 @@ async function handlePlanner(req, res, u) {
     const key = process.env.NVIDIA_FLASH_KEY || process.env.NVIDIA_API_KEY;
     if (!key) return json(res, 503, { error: 'Viora Flash is not configured on the server.' });
     let state; try { state = await getPlanner(actor); } catch { return json(res, 503, { error: 'Planner data could not be loaded.' }); }
-    const selected = Array.isArray(body.selectedTaskIds) ? [...new Set(body.selectedTaskIds.filter(id => state.tasks.some(task => task.id === id))].slice(0, 30) : [];
+    const selected = Array.isArray(body.selectedTaskIds) ? [...new Set(body.selectedTaskIds.filter(id => state.tasks.some(task => task.id === id)))].slice(0, 30) : [];
     const weekEnd = new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10);
     const highlighted = state.tasks.filter(task => task.status !== 'completed' && task.dueDate && task.dueDate <= weekEnd);
     const relevantTasks = [...new Map([...state.tasks.slice(-250), ...highlighted, ...selected.map(id => state.tasks.find(task => task.id === id))].filter(Boolean).map(task => [task.id, task])).values()].slice(-400);
