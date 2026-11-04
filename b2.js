@@ -17,33 +17,23 @@ export const b2Ready = () => Boolean(B2_KEY_ID && B2_APP_KEY && B2_BUCKET && END
 const sha256 = (d) => crypto.createHash('sha256').update(d).digest('hex');
 const hmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
 
-async function request(method, key, body) {
+const awsEncode = value => encodeURIComponent(String(value)).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+async function request(method, key, body, queryParams = null) {
   if (!b2Ready()) throw new Error('Backblaze B2 is not configured');
   const host = new URL(ENDPOINT).host;
-  const path = '/' + [B2_BUCKET, ...key.split('/')].map(encodeURIComponent).join('/');
+  const objectParts = key ? key.split('/') : [];
+  const path = '/' + [B2_BUCKET, ...objectParts].map(awsEncode).join('/');
+  const query = queryParams ? [...queryParams.entries()].map(([k, v]) => [awsEncode(k), awsEncode(v)]).sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1])).map(([k, v]) => k + '=' + v).join('&') : '';
   const payload = body == null ? '' : body;
   const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
   const day = amzDate.slice(0, 8);
   const payloadHash = sha256(payload);
   const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
   const canonical = [
-    method, path, '',
+    method, path, query,
     `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`,
     signedHeaders, payloadHash
   ].join('\n');
-  const scope = `${day}/${REGION}/s3/aws4_request`;
-  const toSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256(canonical)].join('\n');
-  const signingKey = hmac(hmac(hmac(hmac('AWS4' + B2_APP_KEY, day), REGION), 's3'), 'aws4_request');
-  const signature = crypto.createHmac('sha256', signingKey).update(toSign).digest('hex');
-  const headers = {
-    'x-amz-date': amzDate,
-    'x-amz-content-sha256': payloadHash,
-    Authorization: `AWS4-HMAC-SHA256 Credential=${B2_KEY_ID}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
-  };
-  if (method === 'PUT') headers['Content-Type'] = 'application/json';
-  return fetch(ENDPOINT + path, { method, headers, body: method === 'PUT' ? payload : undefined, signal: AbortSignal.timeout(10000) });
-}
-
 /** Read a JSON object. Returns null when it does not exist yet. */
 export async function getJson(key) {
   const r = await request('GET', key);
@@ -60,3 +50,19 @@ export async function putJson(key, obj) {
 
 /** One private object per account. The key is a hash, so emails never appear in file names. */
 export const userKey = (email) => `users/${sha256(String(email).trim().toLowerCase())}.json`;
+
+/** List object keys from the private bucket without exposing credentials to callers. */
+export async function listKeys(prefix = '', continuationToken = '', maxKeys = 1000) {
+  const params = new URLSearchParams();
+  params.set('list-type', '2');
+  params.set('max-keys', String(Math.max(1, Math.min(1000, Math.floor(maxKeys) || 1000))));
+  if (prefix) params.set('prefix', prefix);
+  if (continuationToken) params.set('continuation-token', continuationToken);
+  const r = await request('GET', '', null, params);
+  if (!r.ok) throw new Error(`B2 LIST ${r.status}`);
+  const xml = await r.text();
+  const unxml = value => value.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+  const keys = [...xml.matchAll(/<Key>([\\s\\S]*?)<\\/Key>/g)].map(match => unxml(match[1]));
+  const next = xml.match(/<NextContinuationToken>([\\s\\S]*?)<\\/NextContinuationToken>/);
+  return { keys, truncated: /<IsTruncated>true<\\/IsTruncated>/i.test(xml), nextToken: next ? unxml(next[1]) : '' };
+}

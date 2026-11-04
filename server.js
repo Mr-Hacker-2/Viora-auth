@@ -1,7 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
-import { b2Ready, getJson, putJson, userKey } from './b2.js';
+import { b2Ready, getJson, putJson, userKey, listKeys } from './b2.js';
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { buildResearchQueries, rankResearchSources, researchLimits, researchMode } from './research.js';
 import { createSseCompletionTracker } from './stream-completion.js';
@@ -10,6 +10,9 @@ const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
 const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
 const ALLOWED_EXT = (process.env.ALLOWED_EXT || 'kkcljeingbbpgbilahlaganmmgggbkik').split(',');
 const SITE = (process.env.SITE_URL || "").replace(/\/$/, "");
+const ADMIN_EMAILS = new Set(String(process.env.ADMIN_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+const normEmail = value => String(value || '').trim().toLowerCase();
+const runtimeMetrics = { startedAt: new Date().toISOString(), aiRequests: 0, byAssistant: Object.create(null) };
 const REDIRECT = `${BASE}/auth/callback`;
 
 if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !TOKEN_SECRET) {
@@ -63,6 +66,184 @@ const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'applic
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
 const userOf = (req) => unsign((req.headers.authorization || '').replace(/^Bearer /, ''));
 
+async function writeAdminAudit(actor, action, target, outcome, details = {}) {
+  if (!b2Ready()) return;
+  const event = {
+    at: new Date().toISOString(),
+    actor: String(actor || '').slice(0, 254),
+    action: String(action || '').slice(0, 80),
+    target: String(target || '').slice(0, 254),
+    outcome: String(outcome || '').slice(0, 40),
+    details
+  };
+  const key = 'admin/audit/' + Date.now() + '_' + crypto.randomUUID() + '.json';
+  try { await putJson(key, event); }
+  catch (error) { console.error('admin audit write failed:', error?.message || error); }
+}
+async function adminAuth(req) {
+  const user = userOf(req);
+  if (!user || !user.email) return { code: 401, error: 'Please sign in again.' };
+  const email = normEmail(user.email);
+  if (ADMIN_EMAILS.has(email)) return { user: { ...user, email }, role: 'admin' };
+  if (!b2Ready()) return { code: 503, error: 'Admin roles require configured account storage.' };
+  let record;
+  try { record = await getJson(userKey(email)); }
+  catch { return { code: 503, error: 'Administrator access could not be checked.' }; }
+  if (record?.status === 'suspended') return { code: 403, error: 'This account is suspended.' };
+  if (record?.role !== 'admin') return { code: 403, error: 'Administrator access is required.' };
+  return { user: { ...user, email }, role: 'admin' };
+}
+async function readAdminUsers(maxRecords = 2000) {
+  if (!b2Ready()) throw new Error('storage_off');
+  const keys = [];
+  let token = '';
+  let truncated = false;
+  while (keys.length < maxRecords) {
+    const page = await listKeys('users/', token, Math.min(1000, maxRecords - keys.length));
+    keys.push(...page.keys);
+    if (!page.truncated || !page.nextToken) { token = ''; break; }
+    token = page.nextToken;
+  }
+  if (token) truncated = true;
+  const rows = [];
+  for (let i = 0; i < keys.length; i += 25) {
+    const batch = await Promise.all(keys.slice(i, i + 25).map(async key => {
+      try { return await getJson(key); } catch { return null; }
+    }));
+    rows.push(...batch.filter(row => row && row.email));
+  }
+  return { rows, truncated };
+}
+async function handleAdmin(req, res, u) {
+  const auth = await adminAuth(req);
+  if (auth.code) return json(res, auth.code, { error: auth.error });
+  const actor = auth.user.email;
+  if (limited('admin:' + actor)) return json(res, 429, { error: 'Slow down a little, then try again.' });
+  const path = u.pathname;
+  if (req.method === 'GET' && path === '/api/admin/session') {
+    return json(res, 200, { ok: true, role: 'admin', email: actor });
+  }
+  if (req.method === 'GET' && path === '/api/admin/models') {
+    const models = Object.entries(ASSIST).map(([id, config]) => ({
+      id, name: id === 'flash' ? 'Viora Flash' : id === 'search' ? 'Pro Search' : id === 'math' ? 'Math & Code' : 'Humanizer',
+      provider: 'NVIDIA NIM',
+      configured: !!(process.env['NVIDIA_' + config.env + '_KEY'] || process.env.NVIDIA_API_KEY),
+      modelNames: config.chain.slice(),
+      connection: 'not_tested'
+    }));
+    models.unshift({ id: 'auto', name: 'Viora Auto', provider: 'Viora router', configured: true, modelNames: [], connection: 'not_applicable' });
+    const multimodalKey = !!(process.env.NVIDIA_MATH_KEY || process.env.NVIDIA_API_KEY);
+    models.push({ id: 'image', name: 'Image understanding', provider: 'NVIDIA NIM', configured: multimodalKey, modelNames: ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', 'meta/llama-3.2-90b-vision-instruct'], connection: 'not_tested' });
+    models.push({ id: 'video', name: 'Video understanding', provider: 'NVIDIA NIM', configured: multimodalKey, modelNames: ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning'], connection: 'not_tested' });
+    return json(res, 200, { provider: 'NVIDIA NIM', models, controls: 'unavailable' });
+  }
+  if (req.method === 'GET' && path === '/api/admin/overview') {
+    try {
+      const { rows, truncated } = await readAdminUsers();
+      const now = Date.now(), day = 86400000, today = new Date().toISOString().slice(0, 10);
+      const recentUsers = rows.filter(row => Date.parse(row.lastLoginAt || '') >= now - 30 * day).length;
+      const createdToday = rows.filter(row => String(row.createdAt || '').slice(0, 10) === today).length;
+      const createdWeek = rows.filter(row => Date.parse(row.createdAt || '') >= now - 7 * day).length;
+      return json(res, 200, {
+        users: { total: rows.length, complete: !truncated, newToday: truncated ? null : createdToday, newWeek: truncated ? null : createdWeek, recentSignIns30d: truncated ? null : recentUsers },
+        ai: { requestsSince: runtimeMetrics.startedAt, submittedRequests: runtimeMetrics.aiRequests, byAssistant: runtimeMetrics.byAssistant },
+        unavailable: { conversations: 'Chat histories stay in each user’s browser and are not collected by the server.', uploadedFiles: 'Uploads are processed for a request and are not stored as an admin metric.', estimatedCost: 'Provider billing data is not available to this server.' },
+        history: truncated ? 'User totals are a lower bound because the account listing reached its safety limit.' : null
+      });
+    } catch (error) {
+      return json(res, 503, { error: error.message === 'storage_off' ? 'Account storage is not configured.' : 'Account storage could not be read.' });
+    }
+  }
+  if (req.method === 'GET' && path === '/api/admin/users') {
+    try {
+      const { rows, truncated } = await readAdminUsers();
+      const query = String(u.searchParams.get('q') || '').trim().toLowerCase().slice(0, 120);
+      const page = Math.max(1, Math.min(100, Number.parseInt(u.searchParams.get('page') || '1', 10) || 1));
+      const perPage = Math.max(1, Math.min(50, Number.parseInt(u.searchParams.get('perPage') || '25', 10) || 25));
+      const sorted = rows.map(row => ({
+        email: normEmail(row.email), name: String(row.name || '').slice(0, 120),
+        picture: String(row.picture || '').startsWith('https://') ? row.picture : '',
+        createdAt: row.createdAt || null, lastLoginAt: row.lastLoginAt || null, logins: Number(row.logins) || 0,
+        role: ADMIN_EMAILS.has(normEmail(row.email)) || row.role === 'admin' ? 'admin' : 'user',
+        roleManagedBy: ADMIN_EMAILS.has(normEmail(row.email)) ? 'server environment' : 'admin'
+      })).filter(row => !query || (row.email + ' ' + row.name).toLowerCase().includes(query))
+        .sort((a, b) => String(b.lastLoginAt || '').localeCompare(String(a.lastLoginAt || '')));
+      const start = (page - 1) * perPage;
+      return json(res, 200, { users: sorted.slice(start, start + perPage), total: truncated ? null : sorted.length, page, perPage, truncated });
+    } catch (error) {
+      return json(res, 503, { error: error.message === 'storage_off' ? 'Account storage is not configured.' : 'Account records could not be read.' });
+    }
+  }
+  if (req.method === 'POST' && path === '/api/admin/users/role') {
+    let body;
+    try { body = await readBody(req, 5000); }
+    catch { return json(res, 400, { error: 'Invalid request body.' }); }
+    const email = normEmail(body.email), role = body.role;
+    if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) || !['admin', 'user'].includes(role)) return json(res, 400, { error: 'A valid email and supported role are required.' });
+    if (ADMIN_EMAILS.has(email)) return json(res, 409, { error: 'This administrator is managed by the server environment.' });
+    if (email === actor && role !== 'admin') return json(res, 409, { error: 'You cannot remove your own administrator role.' });
+    if (!b2Ready()) return json(res, 503, { error: 'Account storage is not configured.' });
+    try {
+      const key = userKey(email), record = await getJson(key);
+      if (!record) return json(res, 404, { error: 'User account was not found.' });
+      const prior = record.role === 'admin' ? 'admin' : 'user';
+      record.role = role;
+      await putJson(key, record);
+      await writeAdminAudit(actor, 'user_role_changed', email, 'success', { from: prior, to: role });
+      return json(res, 200, { ok: true, email, role });
+    } catch (error) {
+      await writeAdminAudit(actor, 'user_role_changed', email, 'failed', { to: role });
+      return json(res, 503, { error: 'The role change could not be saved.' });
+    }
+  }
+  if (req.method === 'GET' && path === '/api/admin/activity') {
+    if (!b2Ready()) return json(res, 503, { error: 'Audit storage is not configured.' });
+    try {
+      const keys = [];
+      let token = '';
+      while (keys.length < 5000) {
+        const page = await listKeys('admin/audit/', token, Math.min(1000, 5000 - keys.length));
+        keys.push(...page.keys);
+        if (!page.truncated || !page.nextToken) { token = ''; break; }
+        token = page.nextToken;
+      }
+      const recentKeys = keys.sort().slice(-100).reverse();
+      const events = [];
+      for (let i = 0; i < recentKeys.length; i += 25) {
+        const batch = await Promise.all(recentKeys.slice(i, i + 25).map(async key => { try { return await getJson(key); } catch { return null; } }));
+        events.push(...batch.filter(Boolean));
+      }
+      return json(res, 200, { events: events.sort((a, b) => String(b.at).localeCompare(String(a.at))), truncated: !!token });
+    } catch { return json(res, 503, { error: 'Audit records could not be read.' }); }
+  }
+  if (req.method === 'GET' && path === '/api/admin/health') {
+    const checkedAt = new Date().toISOString();
+    let storage = b2Ready() ? 'configured' : 'not_configured';
+    if (b2Ready()) {
+      try { await listKeys('users/', '', 1); storage = 'reachable'; }
+      catch { storage = 'unreachable'; }
+    }
+    const providerConfigured = !!(process.env.NVIDIA_API_KEY || process.env.NVIDIA_FLASH_KEY || process.env.NVIDIA_SEARCH_KEY || process.env.NVIDIA_MATH_KEY || process.env.NVIDIA_HUMANIZER_KEY);
+    return json(res, 200, {
+      checkedAt, version: process.env.RENDER_GIT_COMMIT || 'unknown',
+      backend: 'healthy', auth: 'verified_for_this_request', storage,
+      aiProvider: { name: 'NVIDIA NIM', credentialsConfigured: providerConfigured, connection: 'not_tested' },
+      adminBootstrap: ADMIN_EMAILS.size ? 'configured' : 'not_configured'
+    });
+  }
+  if (req.method === 'GET' && path === '/api/admin/settings') {
+    return json(res, 200, {
+      rolePolicy: 'ADMIN_EMAILS bootstraps administrators; only an authenticated server-authorized administrator can grant a stored role.',
+      bootstrapAdminCount: ADMIN_EMAILS.size,
+      perUserRateLimit: '40 requests per 60 seconds (in-memory)',
+      editableFeatures: 'unavailable',
+      sessionManagement: 'unavailable'
+    });
+  }
+  return json(res, 404, { error: 'Admin endpoint not found.' });
+}
+
+
 /* ================= accounts in Backblaze B2 (one private JSON object per user) ================= */
 const answerCache = new Map(); // email -> { answers, at }; keeps chat from reading B2 on every message
 async function cachedAnswers(email) {
@@ -86,6 +267,7 @@ async function recordSignIn(user, mode) {
       lastLoginAt: now, logins: ((old && old.logins) || 0) + 1
     };
     await putJson(key, rec);
+    await writeAdminAudit(user.email, 'login', user.email, 'success');
     return rec;
   } catch (e) { console.error('B2 sign-in save failed:', e?.message || e); return null; }
 }
@@ -307,6 +489,8 @@ async function reviewAnswer(key, model, question, draft, sources = [], attachmen
 async function chat(req, res, user) {
   const b = await readBody(req, 16e6), a = ASSIST[b.assistant];
   if (!a || !Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: 'Bad request.' });
+  runtimeMetrics.aiRequests++;
+  runtimeMetrics.byAssistant[b.assistant] = (runtimeMetrics.byAssistant[b.assistant] || 0) + 1;
   const researchRequestId = /^[a-zA-Z0-9_-]{8,80}$/.test(String(b.researchRequestId || '')) ? String(b.researchRequestId) : '';
   const reportProgress = (step, detail) => setResearchState(researchRequestId, user.email, step, detail);
   let clientGone = false;
@@ -652,6 +836,7 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, BASE);
   try {
     if (req.method === 'OPTIONS') { res.writeHead(204, cors()); return res.end(); }
+    if (u.pathname.startsWith('/api/admin/')) return await handleAdmin(req, res, u);
     if (req.method === 'GET' && u.pathname === '/api/progress') {
       const user = userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
