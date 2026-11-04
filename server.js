@@ -11,6 +11,8 @@ const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
 const ALLOWED_EXT = (process.env.ALLOWED_EXT || 'kkcljeingbbpgbilahlaganmmgggbkik').split(',');
 const SITE = (process.env.SITE_URL || "").replace(/\/$/, "");
 const ADMIN_EMAILS = new Set(String(process.env.ADMIN_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || '';
+const adminLoginAttempts = new Map();
 const normEmail = value => String(value || '').trim().toLowerCase();
 const runtimeMetrics = { startedAt: new Date().toISOString(), aiRequests: 0, byAssistant: Object.create(null) };
 const REDIRECT = `${BASE}/auth/callback`;
@@ -128,6 +130,34 @@ async function readAdminUsers(maxRecords = 2000) {
   }
   return { rows, truncated };
 }
+async function handleAdminPasswordLogin(req, res) {
+  const ip = req.socket?.remoteAddress || 'unknown';
+  const now = Date.now();
+  const attempts = (adminLoginAttempts.get(ip) || []).filter(at => now - at < 15 * 60e3);
+  if (attempts.length >= 5) return json(res, 429, { error: 'Too many sign-in attempts. Try again in 15 minutes.' });
+  attempts.push(now);
+  adminLoginAttempts.set(ip, attempts);
+  for (const [key, values] of adminLoginAttempts) {
+    const recent = values.filter(at => now - at < 15 * 60e3);
+    if (recent.length) adminLoginAttempts.set(key, recent); else adminLoginAttempts.delete(key);
+  }
+  if (!ADMIN_ACCESS_PASSWORD || !ADMIN_EMAILS.size) {
+    return json(res, 503, { error: 'Admin password sign-in is not configured on the server.' });
+  }
+  let body;
+  try { body = await readBody(req, 2048); }
+  catch { return json(res, 400, { error: 'Invalid sign-in request.' }); }
+  const supplied = Buffer.from(String(body.password || ''), 'utf8');
+  const expected = Buffer.from(ADMIN_ACCESS_PASSWORD, 'utf8');
+  const valid = supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+  if (!valid) return json(res, 401, { error: 'Incorrect administrator password.' });
+  const email = [...ADMIN_EMAILS][0];
+  const expiresAt = Date.now() + 12 * 60 * 60e3;
+  const token = sign({ email, name: 'Viora Administrator', exp: expiresAt });
+  await writeAdminAudit(email, 'admin_password_login', email, 'success');
+  return json(res, 200, { ok: true, token, email, expiresAt });
+}
+
 async function handleAdmin(req, res, u) {
   const auth = await adminAuth(req);
   if (auth.code) return json(res, auth.code, { error: auth.error });
@@ -884,6 +914,7 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, BASE);
   try {
     if (req.method === 'OPTIONS') { res.writeHead(204, cors()); return res.end(); }
+    if (req.method === 'POST' && u.pathname === '/api/admin/login') return await handleAdminPasswordLogin(req, res);
     if (u.pathname.startsWith('/api/admin/')) return await handleAdmin(req, res, u);
     if (req.method === 'GET' && u.pathname === '/api/progress') {
       const user = await userOf(req);
