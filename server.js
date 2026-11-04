@@ -99,7 +99,7 @@ async function adminAuth(req) {
   if (!user || !user.email) return { code: 401, error: 'Please sign in again.' };
   const email = normEmail(user.email);
   if (ADMIN_EMAILS.has(email)) return { user: { ...user, email }, role: 'admin' };
-  if (!b2Ready()) return { code: 503, error: 'Admin roles require configured account storage.' };
+  if (!b2Ready()) return { code: 403, error: 'Administrator access is required. The owner can add this account to ADMIN_EMAILS in Render.' };
   let record;
   try { record = await getJson(userKey(email)); }
   catch { return { code: 503, error: 'Administrator access could not be checked.' }; }
