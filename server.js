@@ -202,6 +202,12 @@ async function handleAdmin(req, res, u) {
       const key = userKey(email), record = await getJson(key);
       if (!record) return json(res, 404, { error: 'User account was not found.' });
       const prior = record.role === 'admin' ? 'admin' : 'user';
+      if (role === 'user' && prior === 'admin') {
+        if (!ADMIN_EMAILS.size) return json(res, 503, { error: 'Configure ADMIN_EMAILS before changing administrator roles.' });
+        const roster = await readAdminUsers();
+        const administrators = new Set([...ADMIN_EMAILS, ...roster.rows.filter(row => row.role === 'admin').map(row => normEmail(row.email))]);
+        if (roster.truncated || administrators.size <= 1) return json(res, 409, { error: 'The last configured administrator cannot be removed.' });
+      }
       record.role = role;
       await putJson(key, record);
       await writeAdminAudit(actor, 'user_role_changed', email, 'success', { from: prior, to: role });
