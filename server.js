@@ -131,9 +131,8 @@ async function readAdminUsers(maxRecords = 2000) {
   return { rows, truncated };
 }
 const plannerPending = new Map();
-const plannerStates = new Map();
 const PLANNER_LIMITS = { projects: 100, tasks: 2500, title: 180, text: 8000, comment: 2000 };
-const plannerKey = email => userKey(email).replace(/^users\\//, 'planner/');
+const plannerKey = email => userKey(email).replace(/^users\//, 'planner/');
 const plannerId = () => crypto.randomUUID();
 const plannerNow = () => new Date().toISOString();
 function emptyPlanner() { return { version: 1, projects: [], tasks: [], activity: [] }; }
@@ -143,7 +142,7 @@ function plannerText(value, max = PLANNER_LIMITS.text) {
 function plannerDate(value) {
   if (value == null || value === '') return '';
   const s = String(value);
-  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s) || Number.isNaN(Date.parse(s + 'T00:00:00Z')) || new Date(s + 'T00:00:00Z').toISOString().slice(0, 10) !== s) throw new Error('Use a valid YYYY-MM-DD date.');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(Date.parse(s + 'T00:00:00Z')) || new Date(s + 'T00:00:00Z').toISOString().slice(0, 10) !== s) throw new Error('Use a valid YYYY-MM-DD date.');
   return s;
 }
 function plannerRecord(state, actor, action, target, detail = '') {
@@ -273,7 +272,7 @@ async function plannerModel(messages, key) {
       const data = await response.json();
       const raw = data.choices?.[0]?.message?.content;
       const text = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.map(item => item.text || '').join('') : '';
-      const match = text.match(/\\{[\\s\\S]*\\}/);
+      const match = text.match(/\{[\s\S]*\}/);
       if (!match) { last = 'Flash returned an invalid action plan.'; continue; }
       return JSON.parse(match[0]);
     } catch (error) { last = error?.name === 'TimeoutError' ? 'Flash timed out.' : 'Flash could not complete the request.'; }
