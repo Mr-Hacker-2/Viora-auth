@@ -64,7 +64,21 @@ const limited = (k) => { const n = Date.now(), a = (hits.get(k) || []).filter((t
 const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Vary': 'Origin' });
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', ...cors() }); res.end(JSON.stringify(obj)); };
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
-const userOf = (req) => unsign((req.headers.authorization || '').replace(/^Bearer /, ''));
+const accountAuthCache = new Map();
+async function accountAllowed(email) {
+  if (!b2Ready()) return true;
+  const key = normEmail(email), cached = accountAuthCache.get(key);
+  if (cached && cached.until > Date.now()) return cached.allowed;
+  const record = await getJson(userKey(key));
+  const allowed = record?.status !== 'suspended';
+  accountAuthCache.set(key, { allowed, until: Date.now() + 10000 });
+  return allowed;
+}
+const userOf = async req => {
+  const user = unsign((req.headers.authorization || '').replace(/^Bearer /, ''));
+  if (!user || !user.email) return null;
+  return await accountAllowed(user.email) ? { ...user, email: normEmail(user.email) } : null;
+};
 
 async function writeAdminAudit(actor, action, target, outcome, details = {}) {
   if (!b2Ready()) return;
@@ -81,7 +95,7 @@ async function writeAdminAudit(actor, action, target, outcome, details = {}) {
   catch (error) { console.error('admin audit write failed:', error?.message || error); }
 }
 async function adminAuth(req) {
-  const user = userOf(req);
+  const user = await userOf(req);
   if (!user || !user.email) return { code: 401, error: 'Please sign in again.' };
   const email = normEmail(user.email);
   if (ADMIN_EMAILS.has(email)) return { user: { ...user, email }, role: 'admin' };
@@ -131,8 +145,8 @@ async function handleAdmin(req, res, u) {
       modelNames: config.chain.slice(),
       connection: 'not_tested'
     }));
-    models.unshift({ id: 'auto', name: 'Viora Auto', provider: 'Viora router', configured: true, modelNames: [], connection: 'not_applicable' });
-    const multimodalKey = !!(process.env.NVIDIA_MATH_KEY || process.env.NVIDIA_API_KEY);
+    models.unshift({ id: 'auto', name: 'Viora Auto', provider: 'Viora router', configured: null, modelNames: [], connection: 'router' });
+    const multimodalKey = null;
     models.push({ id: 'image', name: 'Image understanding', provider: 'NVIDIA NIM', configured: multimodalKey, modelNames: ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', 'meta/llama-3.2-90b-vision-instruct'], connection: 'not_tested' });
     models.push({ id: 'video', name: 'Video understanding', provider: 'NVIDIA NIM', configured: multimodalKey, modelNames: ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning'], connection: 'not_tested' });
     return json(res, 200, { provider: 'NVIDIA NIM', models, controls: 'unavailable' });
@@ -165,7 +179,8 @@ async function handleAdmin(req, res, u) {
         picture: String(row.picture || '').startsWith('https://') ? row.picture : '',
         createdAt: row.createdAt || null, lastLoginAt: row.lastLoginAt || null, logins: Number(row.logins) || 0,
         role: ADMIN_EMAILS.has(normEmail(row.email)) || row.role === 'admin' ? 'admin' : 'user',
-        roleManagedBy: ADMIN_EMAILS.has(normEmail(row.email)) ? 'server environment' : 'admin'
+        roleManagedBy: ADMIN_EMAILS.has(normEmail(row.email)) ? 'server environment' : 'admin',
+        status: row.status === 'suspended' ? 'suspended' : 'active'
       })).filter(row => !query || (row.email + ' ' + row.name).toLowerCase().includes(query))
         .sort((a, b) => String(b.lastLoginAt || '').localeCompare(String(a.lastLoginAt || '')));
       const start = (page - 1) * perPage;
@@ -194,6 +209,30 @@ async function handleAdmin(req, res, u) {
     } catch (error) {
       await writeAdminAudit(actor, 'user_role_changed', email, 'failed', { to: role });
       return json(res, 503, { error: 'The role change could not be saved.' });
+    }
+  }
+  if (req.method === 'POST' && path === '/api/admin/users/status') {
+    let body;
+    try { body = await readBody(req, 5000); }
+    catch { return json(res, 400, { error: 'Invalid request body.' }); }
+    const email = normEmail(body.email), status = body.status;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !['active', 'suspended'].includes(status)) return json(res, 400, { error: 'A valid email and supported status are required.' });
+    if (email === actor) return json(res, 409, { error: 'You cannot suspend your own administrator account.' });
+    if (ADMIN_EMAILS.has(email)) return json(res, 409, { error: 'This administrator is managed by the server environment.' });
+    if (!b2Ready()) return json(res, 503, { error: 'Account storage is not configured.' });
+    try {
+      const key = userKey(email), record = await getJson(key);
+      if (!record) return json(res, 404, { error: 'User account was not found.' });
+      if (record.role === 'admin') return json(res, 409, { error: 'Remove administrator access before changing this account status.' });
+      const prior = record.status === 'suspended' ? 'suspended' : 'active';
+      record.status = status;
+      await putJson(key, record);
+      accountAuthCache.delete(email);
+      await writeAdminAudit(actor, 'user_status_changed', email, 'success', { from: prior, to: status });
+      return json(res, 200, { ok: true, email, status });
+    } catch {
+      await writeAdminAudit(actor, 'user_status_changed', email, 'failed', { to: status });
+      return json(res, 503, { error: 'The account status could not be saved.' });
     }
   }
   if (req.method === 'GET' && path === '/api/admin/activity') {
@@ -261,6 +300,10 @@ async function recordSignIn(user, mode) {
   try {
     const key = userKey(user.email), now = new Date().toISOString();
     const old = await getJson(key);
+    if (old?.status === 'suspended') {
+      await writeAdminAudit(user.email, 'login', user.email, 'denied', { reason: 'suspended' });
+      return old;
+    }
     const rec = {
       ...(old || { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),
       email: user.email, name: user.name, picture: user.picture, provider: 'google',
@@ -838,14 +881,14 @@ http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') { res.writeHead(204, cors()); return res.end(); }
     if (u.pathname.startsWith('/api/admin/')) return await handleAdmin(req, res, u);
     if (req.method === 'GET' && u.pathname === '/api/progress') {
-      const user = userOf(req);
+      const user = await userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
       const id = u.searchParams.get('id') || '', state = researchStates.get(id);
       if (!state || state.expiresAt <= Date.now() || state.owner !== user.email) return json(res, 404, { error: 'Research progress is unavailable.' });
       return json(res, 200, { step: state.step, detail: state.detail });
     }
     if (u.pathname === '/api/chat' || u.pathname === '/api/read') {
-      const user = userOf(req);
+      const user = await userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
       if (limited(user.email)) return json(res, 429, { error: 'Slow down a little, then try again.' });
       if (u.pathname === '/api/chat') return await chat(req, res, user);
@@ -887,13 +930,14 @@ http.createServer(async (req, res) => {
       })).json();
       if (!info.email || !info.email_verified) return back(res, st, { error: 'unverified_email' });
       const user = { email: info.email, name: info.name || '', picture: info.picture || '' };
-      await recordSignIn(user, st.mode);
+      const account = await recordSignIn(user, st.mode);
+      if (account?.status === 'suspended') return back(res, st, { error: 'account_suspended' });
       return back(res, st, { token: sign({ ...user, exp: Date.now() + 30 * 864e5 }), ...user });
     }
 
     // The sign-up questions and this user's saved answers (stored in Backblaze B2).
     if (u.pathname === '/api/profile') {
-      const user = userOf(req);
+      const user = await userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
       if (limited(user.email)) return json(res, 429, { error: 'Slow down a little, then try again.' });
       if (!b2Ready()) return json(res, 503, { error: 'storage_off' });
@@ -918,8 +962,9 @@ http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/verify') {
       const o = unsign(u.searchParams.get('token'));
-      res.writeHead(o ? 200 : 401, { 'Content-Type': 'application/json', ...cors() });
-      return res.end(JSON.stringify(o ? { email: o.email, name: o.name, picture: o.picture } : { error: 'invalid' }));
+      const valid = !!(o && o.email && await accountAllowed(o.email));
+      res.writeHead(valid ? 200 : 401, { 'Content-Type': 'application/json', ...cors() });
+      return res.end(JSON.stringify(valid ? { email: o.email, name: o.name, picture: o.picture } : { error: 'invalid' }));
     }
 
     res.writeHead(200, { 'Content-Type': 'text/plain' });
