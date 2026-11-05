@@ -5,6 +5,7 @@ import { b2Ready, getJson, putJson, userKey, listKeys } from './b2.js';
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { buildResearchQueries, rankResearchSources, researchLimits, researchMode } from './research.js';
 import { createSseCompletionTracker } from './stream-completion.js';
+import { accountFlowDecision } from './auth-flow.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
 const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
@@ -36,7 +37,9 @@ const unsign = (t) => {
 };
 // Send the result back to the extension (ext) or to the website (site mode).
 const back = (res, st, params) => {
-  const loc = st.site ? `${SITE}/login.html#` + new URLSearchParams(params) : `https://${st.ext}.chromiumapp.org/?` + new URLSearchParams(params);
+  const page = st.mode === 'signup' ? 'signup' : 'login';
+  const query = st.email ? `?email=${encodeURIComponent(st.email)}` : '';
+  const loc = st.site ? `${SITE}/${page}.html${query}#` + new URLSearchParams(params) : `https://${st.ext}.chromiumapp.org/?` + new URLSearchParams(params);
   res.writeHead(302, { Location: loc });
   res.end();
 };
@@ -567,11 +570,17 @@ async function cachedAnswers(email) {
   return answers;
 }
 /** Create the account on first sign-in, or record a returning sign-in. Never blocks login if storage is down. */
-async function recordSignIn(user, mode) {
-  if (!b2Ready()) { console.warn('Backblaze B2 is not configured; accounts are not being saved'); return null; }
+async function recordSignIn(user, mode, { requireSignupConsent = false, termsAccepted = false } = {}) {
+  if (!b2Ready()) {
+    console.warn('Backblaze B2 is not configured; accounts are not being saved');
+    return requireSignupConsent ? { authError: 'storage_unavailable' } : null;
+  }
   try {
     const key = userKey(user.email), now = new Date().toISOString();
     const old = await getJson(key);
+    // Website sign-in may discover account state only after Google has verified
+    // ownership of this email. A new profile requires an explicit sign-up choice.
+    if (requireSignupConsent && accountFlowDecision({ exists: !!old, mode }) === 'signup-required') return { authError: 'account_not_found' };
     if (old?.status === 'suspended') {
       await writeAdminAudit(user.email, 'login', user.email, 'denied', { reason: 'suspended' });
       return old;
@@ -579,12 +588,16 @@ async function recordSignIn(user, mode) {
     const rec = {
       ...(old || { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),
       email: user.email, name: user.name, picture: user.picture, provider: 'google',
+      ...(requireSignupConsent && mode === 'signup' && termsAccepted ? { termsAcceptedAt: old?.termsAcceptedAt || now } : {}),
       lastLoginAt: now, logins: ((old && old.logins) || 0) + 1
     };
     await putJson(key, rec);
     await writeAdminAudit(user.email, 'login', user.email, 'success');
     return rec;
-  } catch (e) { console.error('B2 sign-in save failed:', e?.message || e); return null; }
+  } catch (e) {
+    console.error('B2 sign-in save failed:', e?.message || e);
+    return requireSignupConsent ? { authError: 'storage_unavailable' } : null;
+  }
 }
 
 const isPrivate = (ip) => /^(10\.|127\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(ip) || /^(::1?$|fc|fd|fe80|::ffff:)/i.test(ip);
@@ -1175,12 +1188,18 @@ http.createServer(async (req, res) => {
       if (site && !SITE) { res.writeHead(500); return res.end('SITE_URL is not set on the server'); }
       if (!site && !ALLOWED_EXT.includes(ext)) { res.writeHead(400); return res.end('Unknown extension'); }
       const mode = u.searchParams.get('mode') === 'signup' ? 'signup' : 'signin';
-      const state = sign({ ext, site, mode, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
+      const termsAccepted = site && mode === 'signup' && u.searchParams.get('terms') === '1';
+      if (site && mode === 'signup' && !termsAccepted) { res.writeHead(400); return res.end('Accept the Terms and Privacy Policy before creating an account.'); }
+      const email = normEmail(u.searchParams.get('email'));
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { res.writeHead(400); return res.end('Enter a valid email address.'); }
+      const state = sign({ ext, site, mode, email, termsAccepted, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
+      const params = new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID, redirect_uri: REDIRECT, response_type: 'code',
+        scope: 'openid email profile', state, prompt: 'select_account'
+      });
+      if (email) params.set('login_hint', email);
       res.writeHead(302, {
-        Location: 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-          client_id: GOOGLE_CLIENT_ID, redirect_uri: REDIRECT, response_type: 'code',
-          scope: 'openid email profile', state, prompt: 'select_account'
-        })
+        Location: 'https://accounts.google.com/o/oauth2/v2/auth?' + params
       });
       return res.end();
     }
@@ -1204,7 +1223,8 @@ http.createServer(async (req, res) => {
       })).json();
       if (!info.email || !info.email_verified) return back(res, st, { error: 'unverified_email' });
       const user = { email: info.email, name: info.name || '', picture: info.picture || '' };
-      const account = await recordSignIn(user, st.mode);
+      const account = await recordSignIn(user, st.mode, { requireSignupConsent: !!st.site, termsAccepted: !!st.termsAccepted });
+      if (account?.authError) return back(res, account.authError === 'account_not_found' ? { ...st, email: normEmail(user.email) } : st, { error: account.authError });
       if (account?.status === 'suspended') return back(res, st, { error: 'account_suspended' });
       return back(res, st, { token: sign({ ...user, exp: Date.now() + 30 * 864e5 }), ...user });
     }
