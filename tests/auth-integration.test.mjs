@@ -69,6 +69,11 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(destination.pathname, '/signup.html');
   const createdToken = new URLSearchParams(destination.hash.slice(1)).get('token');
   assert.ok(createdToken, 'explicit sign-up returns a Viora session token');
+  response = await fetch(`${base}/api/verify?token=${encodeURIComponent(createdToken)}`);
+  assert.equal(response.status, 200, 'created session survives a separate verification request');
+  assert.equal((await response.json()).email, newEmail);
+  response = await fetch(`${base}/api/verify?token=invalid`);
+  assert.equal(response.status, 401, 'invalid sessions are rejected');
 
   response = await callback(await start('signin', newEmail));
   destination = new URL(response.headers.get('location'));
