@@ -50,8 +50,8 @@ test('website OAuth requires explicit sign-up and verifies account state after G
     assert.equal(provider.searchParams.get('login_hint'), email);
     return provider.searchParams.get('state');
   }
-  async function callback(state) {
-    return fetch(`${base}/auth/callback?state=${encodeURIComponent(state)}&code=test-code`, { redirect: 'manual' });
+  async function callback(state, code = 'test-code') {
+    return fetch(`${base}/auth/callback?state=${encodeURIComponent(state)}&code=${encodeURIComponent(code)}`, { redirect: 'manual' });
   }
 
   const newEmail = 'new.user@example.com';
@@ -64,6 +64,8 @@ test('website OAuth requires explicit sign-up and verifies account state after G
 
   const noConsent = await fetch(`${base}/auth/google?site=1&mode=signup&email=${encodeURIComponent(newEmail)}`, { redirect: 'manual' });
   assert.equal(noConsent.status, 400, 'server requires explicit terms acceptance');
+  response = await callback(await start('signup', newEmail, true), 'unverified');
+  assert.equal(new URLSearchParams(new URL(response.headers.get('location')).hash.slice(1)).get('error'), 'unverified_email');
   response = await callback(await start('signup', newEmail, true));
   destination = new URL(response.headers.get('location'));
   assert.equal(destination.pathname, '/signup.html');
