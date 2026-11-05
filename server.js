@@ -1,7 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
-import { b2Ready, getJson, putJson, userKey, listKeys } from './b2.js';
+import { b2Ready, b2ConfigStatus, deleteJson, getJson, putJson, userKey, listKeys } from './b2.js';
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { buildResearchQueries, rankResearchSources, researchLimits, researchMode } from './research.js';
 import { createSseCompletionTracker } from './stream-completion.js';
@@ -63,7 +63,7 @@ function setResearchState(id, owner, step, detail) {
   researchStates.set(id, { owner, step, detail: String(detail || '').slice(0, 180), expiresAt: now + 2 * 60e3 });
 }
 const limited = (k) => { const n = Date.now(), a = (hits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); hits.set(k, a); return a.length > 40; };
-const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Vary': 'Origin' });
+const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS', 'Vary': 'Origin' });
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', ...cors() }); res.end(JSON.stringify(obj)); };
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
 const accountAuthCache = new Map();
@@ -81,6 +81,92 @@ const userOf = async req => {
   if (!user || !user.email) return null;
   return await accountAllowed(user.email) ? { ...user, email: normEmail(user.email) } : null;
 };
+
+const backupUid = email => crypto.createHash('sha256').update(normEmail(email)).digest('hex');
+const backupKey = email => `data/${backupUid(email)}/backup.json`;
+const backupMetaKey = email => `data/${backupUid(email)}/meta.json`;
+function stripSecretSettings(value) {
+  if (Array.isArray(value)) return value.map(stripSecretSettings);
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = key.replace(/[_-]/g, '').toLowerCase();
+    if (['personalkey', 'zerogptkey', 'resolvedmodels', 'apikey', 'appkey', 'secret', 'password', 'token', 'credentials'].includes(normalized)
+      || normalized.endsWith('apikey') || normalized.endsWith('appkey')
+      || ['secret', 'password', 'token', 'credential'].some(part => normalized.includes(part))) continue;
+    out[key] = stripSecretSettings(item);
+  }
+  return out;
+}
+function cleanCloudBackup(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('A backup object is required.');
+  const settings = stripSecretSettings(input.settings && typeof input.settings === 'object' ? input.settings : {});
+  const list = key => Array.isArray(input[key]) ? input[key].slice(0, 10000).map(stripSecretSettings) : [];
+  return {
+    v: 2, savedAt: Date.now(), settings,
+    threads: list('threads'), starred: list('starred'), episodes: list('episodes'),
+    agents: list('agents'),
+    ...(input.website && typeof input.website === 'object' && !Array.isArray(input.website)
+      ? { website: stripSecretSettings(input.website) } : {})
+  };
+}
+async function writeB2Audit(actor, action, outcome, extra = {}) {
+  await writeAdminAudit(actor, action, 'backblaze', outcome, extra);
+}
+async function readAdminAuditEvents(maxRecords = 5000) {
+  const keys = [];
+  let token = '';
+  while (keys.length < maxRecords) {
+    const page = await listKeys('admin/audit/', token, Math.min(1000, maxRecords - keys.length));
+    keys.push(...page.keys);
+    if (!page.truncated || !page.nextToken) { token = ''; break; }
+    token = page.nextToken;
+  }
+  const truncated = !!token;
+  const selected = keys.sort().slice(-maxRecords).reverse();
+  const events = [];
+  for (let i = 0; i < selected.length; i += 25) {
+    const batch = await Promise.all(selected.slice(i, i + 25).map(async key => { try { return await getJson(key); } catch { return null; } }));
+    events.push(...batch.filter(Boolean));
+  }
+  return { events: events.sort((a, b) => String(b.at).localeCompare(String(a.at))), truncated };
+}
+
+async function handleUserBackup(req, res) {
+  const user = await userOf(req);
+  if (!user) return json(res, 401, { error: 'Please sign in again.' });
+  if (!b2Ready()) return json(res, 503, { error: 'Backblaze backup storage is not configured.' });
+  try {
+    if (req.method === 'GET') {
+      const backup = await getJson(backupKey(user.email));
+      await writeB2Audit(user.email, 'b2_download', 'success', { bytes: backup ? Buffer.byteLength(JSON.stringify(backup)) : 0 });
+      return json(res, 200, { backup: backup ? cleanCloudBackup(backup) : null });
+    }
+    if (req.method === 'PUT') {
+      const body = await readBody(req, 16e6);
+      const raw = body.backup;
+      const incoming = cleanCloudBackup(raw);
+      const previous = await getJson(backupKey(user.email));
+      const backup = {
+        ...(previous || {}), ...incoming,
+        settings: raw && Object.hasOwn(raw, 'settings') ? incoming.settings : previous?.settings || {},
+        threads: Array.isArray(raw?.threads) ? incoming.threads : previous?.threads || [],
+        starred: Array.isArray(raw?.starred) ? incoming.starred : previous?.starred || [],
+        episodes: Array.isArray(raw?.episodes) ? incoming.episodes : previous?.episodes || [],
+        agents: Array.isArray(raw?.agents) ? incoming.agents : previous?.agents || [],
+        website: raw?.website && typeof raw.website === 'object' ? incoming.website : previous?.website
+      };
+      await putJson(backupKey(user.email), backup);
+      await putJson(backupMetaKey(user.email), { savedAt: backup.savedAt });
+      await writeB2Audit(user.email, 'b2_upload', 'success', { bytes: Buffer.byteLength(JSON.stringify(backup)) });
+      return json(res, 200, { ok: true, savedAt: backup.savedAt, chats: backup.threads.length });
+    }
+    return json(res, 405, { error: 'Method not allowed.' });
+  } catch (error) {
+    await writeB2Audit(user.email, req.method === 'PUT' ? 'b2_upload' : 'b2_download', 'failed', { error: 'Backblaze request failed.' });
+    return json(res, 502, { error: req.method === 'PUT' ? 'The backup could not be saved to Backblaze.' : 'The backup could not be downloaded from Backblaze.' });
+  }
+}
 
 async function writeAdminAudit(actor, action, target, outcome, details = {}) {
   if (!b2Ready()) return;
@@ -404,6 +490,51 @@ async function handleAdmin(req, res, u) {
   if (req.method === 'GET' && path === '/api/admin/session') {
     return json(res, 200, { ok: true, role: 'admin', email: actor });
   }
+  if (req.method === 'GET' && path === '/api/admin/b2') {
+    const config = b2ConfigStatus();
+    if (!config.configured) return json(res, 200, { config, health: 'not_configured', usage: null, uploads: null, downloads: null, errors: [], events: [] });
+    try {
+      const dataKeys = [];
+      let cursor = '', truncated = false;
+      while (dataKeys.length < 20000) {
+        const page = await listKeys('data/', cursor, Math.min(1000, 20000 - dataKeys.length), true);
+        dataKeys.push(...(page.objects || page.keys.map(key => ({ key, size: 0 }))));
+        if (!page.truncated || !page.nextToken) { cursor = ''; break; }
+        cursor = page.nextToken;
+      }
+      truncated = !!cursor;
+      const { events, truncated: auditTruncated } = await readAdminAuditEvents();
+      const b2Events = events.filter(event => /^b2_(upload|download|health_check)$/.test(event.action || ''));
+      const uploads = b2Events.filter(event => event.action === 'b2_upload' && event.outcome === 'success');
+      const downloads = b2Events.filter(event => event.action === 'b2_download' && event.outcome === 'success');
+      const failures = b2Events.filter(event => event.outcome !== 'success').slice(0, 100);
+      return json(res, 200, {
+        config, health: 'reachable',
+        usage: { objects: dataKeys.filter(item => item.key.endsWith('/backup.json')).length, bytes: dataKeys.reduce((sum, item) => sum + (Number(item.size) || 0), 0), complete: !truncated },
+        uploads: { count: uploads.length, bytes: uploads.reduce((sum, item) => sum + (Number(item.details?.bytes) || 0), 0), complete: !auditTruncated },
+        downloads: { count: downloads.length, bytes: downloads.reduce((sum, item) => sum + (Number(item.details?.bytes) || 0), 0), complete: !auditTruncated },
+        errors: failures, events: b2Events.slice(0, 100)
+      });
+    } catch {
+      return json(res, 503, { config, health: 'unreachable', usage: null, uploads: null, downloads: null, errors: [{ action: 'b2_status', outcome: 'failed', details: { error: 'Storage listing or audit history is unavailable.' } }], events: [] });
+    }
+  }
+  if (req.method === 'POST' && path === '/api/admin/b2/test') {
+    if (!b2Ready()) return json(res, 503, { ok: false, error: 'Backblaze is not configured on the server.' });
+    const id = crypto.randomUUID(), key = 'admin/b2-health/' + id + '.json', marker = { id, at: Date.now() };
+    try {
+      await putJson(key, marker);
+      const saved = await getJson(key);
+      if (saved?.id !== id) throw new Error('health check mismatch');
+      await deleteJson(key);
+      await writeB2Audit(actor, 'b2_health_check', 'success');
+      return json(res, 200, { ok: true, health: 'reachable', checkedAt: new Date().toISOString() });
+    } catch {
+      try { await deleteJson(key); } catch {}
+      await writeB2Audit(actor, 'b2_health_check', 'failed', { error: 'Backblaze connection test failed.' });
+      return json(res, 502, { ok: false, health: 'unreachable', error: 'Backblaze connection test failed. Check server-side credentials and bucket permissions.' });
+    }
+  }
   if (req.method === 'GET' && path === '/api/admin/models') {
     const models = Object.entries(ASSIST).map(([id, config]) => ({
       id, name: id === 'flash' ? 'Viora Flash' : id === 'search' ? 'Pro Search' : id === 'math' ? 'Math & Code' : 'Humanizer',
@@ -510,21 +641,8 @@ async function handleAdmin(req, res, u) {
   if (req.method === 'GET' && path === '/api/admin/activity') {
     if (!b2Ready()) return json(res, 503, { error: 'Audit storage is not configured.' });
     try {
-      const keys = [];
-      let token = '';
-      while (keys.length < 5000) {
-        const page = await listKeys('admin/audit/', token, Math.min(1000, 5000 - keys.length));
-        keys.push(...page.keys);
-        if (!page.truncated || !page.nextToken) { token = ''; break; }
-        token = page.nextToken;
-      }
-      const recentKeys = keys.sort().slice(-100).reverse();
-      const events = [];
-      for (let i = 0; i < recentKeys.length; i += 25) {
-        const batch = await Promise.all(recentKeys.slice(i, i + 25).map(async key => { try { return await getJson(key); } catch { return null; } }));
-        events.push(...batch.filter(Boolean));
-      }
-      return json(res, 200, { events: events.sort((a, b) => String(b.at).localeCompare(String(a.at))), truncated: !!token });
+      const result = await readAdminAuditEvents(100);
+      return json(res, 200, result);
     } catch { return json(res, 503, { error: 'Audit records could not be read.' }); }
   }
   if (req.method === 'GET' && path === '/api/admin/health') {
@@ -1208,6 +1326,8 @@ http.createServer(async (req, res) => {
       if (account?.status === 'suspended') return back(res, st, { error: 'account_suspended' });
       return back(res, st, { token: sign({ ...user, exp: Date.now() + 30 * 864e5 }), ...user });
     }
+
+    if (u.pathname === '/api/backup') return await handleUserBackup(req, res);
 
     // The sign-up questions and this user's saved answers (stored in Backblaze B2).
     if (u.pathname === '/api/profile') {

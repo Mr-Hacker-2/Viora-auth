@@ -65,11 +65,16 @@ export async function putJson(key, obj) {
   if (!r.ok) throw new Error(`B2 PUT ${r.status}`);
 }
 
+export async function deleteJson(key) {
+  const r = await request('DELETE', key);
+  if (!r.ok && r.status !== 404) throw new Error(`B2 DELETE ${r.status}`);
+}
+
 /** One private object per account. The key is a hash, so emails never appear in file names. */
 export const userKey = (email) => `users/${sha256(String(email).trim().toLowerCase())}.json`;
 
 /** List object keys from the private bucket without exposing credentials to callers. */
-export async function listKeys(prefix = '', continuationToken = '', maxKeys = 1000) {
+export async function listKeys(prefix = '', continuationToken = '', maxKeys = 1000, includeObjects = false) {
   const params = new URLSearchParams();
   params.set('list-type', '2');
   params.set('max-keys', String(Math.max(1, Math.min(1000, Math.floor(maxKeys) || 1000))));
@@ -79,7 +84,24 @@ export async function listKeys(prefix = '', continuationToken = '', maxKeys = 10
   if (!r.ok) throw new Error('B2 LIST ' + r.status);
   const xml = await r.text();
   const unxml = value => value.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
-  const keys = [...xml.matchAll(/<Key>([\s\S]*?)<\/Key>/g)].map(match => unxml(match[1]));
+  const objects = [...xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)].map(([, item]) => ({
+    key: unxml((item.match(/<Key>([\s\S]*?)<\/Key>/) || [,''])[1]),
+    size: Number((item.match(/<Size>(\d+)<\/Size>/) || [,'0'])[1]),
+    lastModified: unxml((item.match(/<LastModified>([\s\S]*?)<\/LastModified>/) || [,''])[1])
+  }));
+  const keys = objects.length ? objects.map(object => object.key) : [...xml.matchAll(/<Key>([\s\S]*?)<\/Key>/g)].map(match => unxml(match[1]));
   const next = xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/);
-  return { keys, truncated: /<IsTruncated>true<\/IsTruncated>/i.test(xml), nextToken: next ? unxml(next[1]) : '' };
+  const result = { keys, truncated: /<IsTruncated>true<\/IsTruncated>/i.test(xml), nextToken: next ? unxml(next[1]) : '' };
+  return includeObjects ? { ...result, objects } : result;
+}
+
+export function b2ConfigStatus() {
+  return {
+    configured: b2Ready(),
+    endpointConfigured: Boolean(ENDPOINT),
+    regionConfigured: Boolean(REGION),
+    bucketConfigured: Boolean(B2_BUCKET),
+    keyConfigured: Boolean(B2_KEY_ID && B2_APP_KEY),
+    secretsStoredOnServer: true
+  };
 }
