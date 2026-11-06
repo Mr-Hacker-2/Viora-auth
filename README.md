@@ -1,8 +1,9 @@
 # Viora auth server
-Google sign-in, the AI proxy, and account storage in Backblaze B2.
+Google and email/password sign-in, the AI proxy, and account storage in Backblaze B2.
 
 ## Environment variables (Render)
 Existing: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `TOKEN_SECRET`, `SITE_URL`, `BASE_URL`, `NVIDIA_API_KEY`.
+Email/password verification and recovery (Resend): `EMAIL_API_KEY`, `EMAIL_FROM` (a verified sender on your Resend domain). Password accounts are disabled until both are configured. Keep these values only in Render's server environment; never put them in website JavaScript.
 
 Backblaze B2 (S3-compatible API, no extra packages):
 - `B2_KEY_ID`: application key ID (Backblaze → App Keys)
@@ -18,7 +19,9 @@ One JSON object per account at `users/<sha256 of email>.json`: name, email, pict
 and the answers to the 5 sign-up questions (`profile.js`). Only the fixed option ids are accepted.
 
 ## Routes
-- `GET /auth/google?site=1&mode=signin|signup` → Google, then back to the site; the account is created or updated in B2
+- `GET /auth/google?site=1&mode=signin|signup` → Google OAuth directly, then back to the site; account method conflicts are not silently linked
+- `POST /api/auth/email/register|login|forgot|reset` → server-side password authentication and recovery; passwords use scrypt and email tokens are single-use hashes in B2
+- `GET /auth/email/verify` → verifies a one-time email token and returns to the sign-in page
 - `GET /api/profile` → `{ questions, onboarded, answers }` (Bearer token)
 - `POST /api/profile` with `{ answers }` → validates and saves the answers (Bearer token)
 - `/api/chat` adds the saved answers to the AI's system prompt as background about the user

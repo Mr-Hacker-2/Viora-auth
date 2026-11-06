@@ -1,5 +1,6 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { promisify } from 'node:util';
 import dns from 'node:dns/promises';
 import { b2Ready, getJson, putJson, userKey, listKeys } from './b2.js';
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
@@ -17,6 +18,33 @@ const adminLoginAttempts = new Map();
 const normEmail = value => String(value || '').trim().toLowerCase();
 const runtimeMetrics = { startedAt: new Date().toISOString(), aiRequests: 0, byAssistant: Object.create(null) };
 const REDIRECT = `${BASE}/auth/callback`;
+const scrypt = promisify(crypto.scrypt);
+const authAttempts = new Map();
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PASSWORD_MIN = 10;
+const tokenHash = value => crypto.createHash('sha256').update(value).digest('hex');
+const sameHash = (left, right) => {
+  if (!/^[a-f0-9]{64}$/i.test(String(left || '')) || !/^[a-f0-9]{64}$/i.test(String(right || ''))) return false;
+  return crypto.timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
+};
+function authRateLimited(req, email) {
+  const key = `${req.socket.remoteAddress || 'unknown'}:${normEmail(email)}`;
+  const now = Date.now(), prior = (authAttempts.get(key) || []).filter(at => now - at < 15 * 60e3);
+  prior.push(now); authAttempts.set(key, prior);
+  return prior.length > 12;
+}
+async function sendAccountEmail(to, subject, html) {
+  if (!process.env.EMAIL_API_KEY || !process.env.EMAIL_FROM) throw new Error('Email delivery is not configured');
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST', headers: { Authorization: `Bearer ${process.env.EMAIL_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: process.env.EMAIL_FROM, to: [to], subject, html }), signal: AbortSignal.timeout(10000)
+  });
+  if (!response.ok) throw new Error(`Email provider returned ${response.status}`);
+}
+const safeHtml = value => String(value || '').replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[ch]);
+function sessionFor(user, record) {
+  return sign({ email: normEmail(user.email), name: user.name || record?.name || '', picture: user.picture || record?.picture || '', sv: record?.sessionVersion || 0, exp: Date.now() + 30 * 864e5 });
+}
 
 if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !TOKEN_SECRET) {
   console.error('Missing env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET');
@@ -70,19 +98,20 @@ const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Contro
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', ...cors() }); res.end(JSON.stringify(obj)); };
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
 const accountAuthCache = new Map();
-async function accountAllowed(email) {
+async function accountAllowed(email, sessionVersion = null) {
   if (!b2Ready()) return true;
   const key = normEmail(email), cached = accountAuthCache.get(key);
-  if (cached && cached.until > Date.now()) return cached.allowed;
+  if (cached && cached.until > Date.now()) return cached.allowed && (sessionVersion == null || cached.sessionVersion === sessionVersion);
   const record = await getJson(userKey(key));
   const allowed = record?.status !== 'suspended';
-  accountAuthCache.set(key, { allowed, until: Date.now() + 10000 });
-  return allowed;
+  const currentVersion = record?.sessionVersion || 0;
+  accountAuthCache.set(key, { allowed, sessionVersion: currentVersion, until: Date.now() + 10000 });
+  return allowed && (sessionVersion == null || currentVersion === sessionVersion);
 }
 const userOf = async req => {
   const user = unsign((req.headers.authorization || '').replace(/^Bearer /, ''));
   if (!user || !user.email) return null;
-  return await accountAllowed(user.email) ? { ...user, email: normEmail(user.email) } : null;
+  return await accountAllowed(user.email, user.sv || 0) ? { ...user, email: normEmail(user.email) } : null;
 };
 
 async function writeAdminAudit(actor, action, target, outcome, details = {}) {
@@ -581,6 +610,8 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
     // Website sign-in may discover account state only after Google has verified
     // ownership of this email. A new profile requires an explicit sign-up choice.
     if (requireSignupConsent && accountFlowDecision({ exists: !!old, mode }) === 'signup-required') return { authError: 'account_not_found' };
+    // Never attach a Google identity to an email/password profile implicitly.
+    if (old?.auth?.method === 'email' || old?.provider === 'email') return { authError: 'account_method_conflict' };
     if (old?.status === 'suspended') {
       await writeAdminAudit(user.email, 'login', user.email, 'denied', { reason: 'suspended' });
       return old;
@@ -1167,6 +1198,87 @@ http.createServer(async (req, res) => {
     if (u.pathname.startsWith('/api/planner/')) return await handlePlanner(req, res, u);
     if (req.method === 'POST' && u.pathname === '/api/admin/login') return await handleAdminPasswordLogin(req, res);
     if (u.pathname.startsWith('/api/admin/')) return await handleAdmin(req, res, u);
+    if (req.method === 'POST' && ['/api/auth/email/register', '/api/auth/email/login', '/api/auth/email/forgot', '/api/auth/email/reset'].includes(u.pathname)) {
+      let input;
+      try { input = await readBody(req, 12000); } catch { return json(res, 400, { error: 'Invalid request.' }); }
+      const email = normEmail(input.email);
+      if (!EMAIL_RE.test(email) || email.length > 254) return json(res, 400, { error: 'Enter a valid email address.' });
+      if (authRateLimited(req, email)) return json(res, 429, { error: 'Too many attempts. Please wait a little and try again.' });
+      if (!b2Ready()) return json(res, 503, { error: 'Account storage is temporarily unavailable.' });
+      try {
+        const key = userKey(email), old = await getJson(key), now = new Date().toISOString();
+        if (u.pathname.endsWith('/register')) {
+          const name = String(input.name || '').trim().replace(/\s+/g, ' ').slice(0, 100);
+          const password = String(input.password || '');
+          if (!name) return json(res, 400, { error: 'Enter your name.' });
+          if (password.length < PASSWORD_MIN || password.length > 256) return json(res, 400, { error: `Use a password with at least ${PASSWORD_MIN} characters.` });
+          if (input.termsAccepted !== true) return json(res, 400, { error: 'Accept the Terms and Privacy Policy to create an account.' });
+          if (!process.env.EMAIL_API_KEY || !process.env.EMAIL_FROM) return json(res, 503, { error: 'Email verification is not configured yet. Please use Google sign-in or contact the site owner.' });
+          if (old && old.auth?.method !== 'email') return json(res, 409, { error: 'This email already has an account using another sign-in method. Continue with that method.' });
+          if (old?.auth?.password?.verifiedAt) return json(res, 409, { error: 'An account already uses this email. Sign in or reset your password.' });
+          if (old?.auth?.password) {
+            const priorHash = Buffer.from(old.auth.password.hash, 'hex');
+            const candidate = await scrypt(password, Buffer.from(old.auth.password.salt, 'hex'), 64);
+            if (priorHash.length !== candidate.length || !crypto.timingSafeEqual(priorHash, candidate)) return json(res, 409, { error: 'An account is waiting for email verification. Use the password you chose when signing up.' });
+          }
+          const salt = old?.auth?.password ? Buffer.from(old.auth.password.salt, 'hex') : crypto.randomBytes(16);
+          const passwordHash = old?.auth?.password ? Buffer.from(old.auth.password.hash, 'hex') : await scrypt(password, salt, 64);
+          const verifyToken = crypto.randomBytes(32).toString('base64url');
+          const record = { ...(old || { createdAt: now, signedUpVia: 'email', email, picture: '', sessionVersion: 0, onboarded: false, answers: null, logins: 0 }), name: old?.name || name, provider: 'email', auth: { method: 'email', password: { salt: salt.toString('hex'), hash: passwordHash.toString('hex'), verifiedAt: null }, verify: { hash: tokenHash(verifyToken), expiresAt: Date.now() + 24 * 60 * 60e3 } }, termsAcceptedAt: old?.termsAcceptedAt || now };
+          await putJson(key, record);
+          const verifyUrl = `${BASE}/auth/email/verify?email=${encodeURIComponent(email)}&token=${encodeURIComponent(verifyToken)}`;
+          try { await sendAccountEmail(email, 'Verify your Viora account', `<p>Hi ${safeHtml(name)},</p><p>Verify your Viora account to finish signing up.</p><p><a href="${verifyUrl}">Verify email</a></p><p>This link expires in 24 hours.</p>`); }
+          catch (error) { console.error('verification email failed:', error?.message || error); return json(res, 502, { error: 'We could not send the verification email. Please try again.' }); }
+          return json(res, 201, { ok: true, message: 'Check your email for a verification link.' });
+        }
+        if (u.pathname.endsWith('/login')) {
+          if (!old || old.auth?.method !== 'email' || !old.auth?.password) return json(res, 401, { error: 'We could not sign you in with that email and password. Check your details or use the sign-in method for this account.' });
+          const { salt, hash, verifiedAt } = old.auth.password;
+          const candidate = await scrypt(String(input.password || '').slice(0, 256), Buffer.from(salt, 'hex'), 64);
+          if (candidate.length !== Buffer.from(hash, 'hex').length || !crypto.timingSafeEqual(candidate, Buffer.from(hash, 'hex'))) return json(res, 401, { error: 'We could not sign you in with that email and password. Check your details and try again.' });
+          if (!verifiedAt) return json(res, 403, { error: 'Please verify your email using the link we sent before signing in.' });
+          if (old.status === 'suspended') return json(res, 403, { error: 'This account is suspended.' });
+          old.lastLoginAt = now; old.logins = (old.logins || 0) + 1; await putJson(key, old);
+          accountAuthCache.delete(email);
+          return json(res, 200, { token: sessionFor({ email, name: old.name }, old), user: { email, name: old.name || '', picture: '', provider: 'email' } });
+        }
+        if (u.pathname.endsWith('/forgot')) {
+          // Always return the same response to avoid exposing registered addresses.
+          if (old?.auth?.method === 'email' && old.auth.password?.verifiedAt) {
+            const resetToken = crypto.randomBytes(32).toString('base64url');
+            old.auth.reset = { hash: tokenHash(resetToken), expiresAt: Date.now() + 60 * 60e3 };
+            await putJson(key, old);
+            const resetUrl = `${SITE}/login.html?reset=1&email=${encodeURIComponent(email)}&token=${encodeURIComponent(resetToken)}`;
+            try { await sendAccountEmail(email, 'Reset your Viora password', `<p>We received a request to reset your Viora password.</p><p><a href="${resetUrl}">Choose a new password</a></p><p>This link expires in one hour. If you did not request this, you can ignore this email.</p>`); }
+            catch (error) { console.error('password reset email failed:', error?.message || error); return json(res, 502, { error: 'We could not send the reset email. Please try again.' }); }
+          }
+          return json(res, 200, { ok: true, message: 'If an eligible account exists, a password reset link has been sent.' });
+        }
+        const password = String(input.password || '');
+        if (password.length < PASSWORD_MIN || password.length > 256) return json(res, 400, { error: `Use a password with at least ${PASSWORD_MIN} characters.` });
+        const reset = old?.auth?.reset;
+        if (old?.auth?.method !== 'email' || !reset || reset.expiresAt < Date.now() || !sameHash(reset.hash, tokenHash(String(input.token || '')))) return json(res, 400, { error: 'That reset link is invalid or expired. Request a new one.' });
+        const salt = crypto.randomBytes(16), hash = await scrypt(password, salt, 64);
+        old.auth.password = { salt: salt.toString('hex'), hash: hash.toString('hex'), verifiedAt: old.auth.password.verifiedAt };
+        delete old.auth.reset; old.sessionVersion = (old.sessionVersion || 0) + 1;
+        await putJson(key, old); accountAuthCache.delete(email);
+        return json(res, 200, { ok: true, message: 'Your password has been updated. You can sign in now.' });
+      } catch (error) {
+        console.error('email authentication failed:', error?.message || error);
+        return json(res, 502, { error: 'We could not complete that request. Please try again.' });
+      }
+    }
+    if (req.method === 'GET' && u.pathname === '/auth/email/verify') {
+      const email = normEmail(u.searchParams.get('email')), token = u.searchParams.get('token') || '';
+      if (!EMAIL_RE.test(email) || !token || !b2Ready()) { res.writeHead(302, { Location: `${SITE}/login.html?verified=error` }); return res.end(); }
+      try {
+        const key = userKey(email), record = await getJson(key), verification = record?.auth?.verify;
+        if (!verification || verification.expiresAt < Date.now() || !sameHash(verification.hash, tokenHash(token))) { res.writeHead(302, { Location: `${SITE}/login.html?verified=error` }); return res.end(); }
+        record.auth.password.verifiedAt = new Date().toISOString(); delete record.auth.verify;
+        await putJson(key, record);
+        res.writeHead(302, { Location: `${SITE}/login.html?verified=1&email=${encodeURIComponent(email)}` }); return res.end();
+      } catch (error) { console.error('email verification failed:', error?.message || error); res.writeHead(302, { Location: `${SITE}/login.html?verified=error` }); return res.end(); }
+    }
     if (req.method === 'GET' && u.pathname === '/api/progress') {
       const user = await userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
@@ -1226,7 +1338,7 @@ http.createServer(async (req, res) => {
       const account = await recordSignIn(user, st.mode, { requireSignupConsent: !!st.site, termsAccepted: !!st.termsAccepted });
       if (account?.authError) return back(res, account.authError === 'account_not_found' ? { ...st, email: normEmail(user.email) } : st, { error: account.authError });
       if (account?.status === 'suspended') return back(res, st, { error: 'account_suspended' });
-      return back(res, st, { token: sign({ ...user, exp: Date.now() + 30 * 864e5 }), ...user });
+      return back(res, st, { token: sessionFor(user, account), ...user });
     }
 
     // The sign-up questions and this user's saved answers (stored in Backblaze B2).
@@ -1256,9 +1368,10 @@ http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/verify') {
       const o = unsign(u.searchParams.get('token'));
-      const valid = !!(o && o.email && await accountAllowed(o.email));
+      const valid = !!(o && o.email && await accountAllowed(o.email, o.sv || 0));
+      const record = valid && b2Ready() ? await getJson(userKey(o.email)) : null;
       res.writeHead(valid ? 200 : 401, { 'Content-Type': 'application/json', ...cors() });
-      return res.end(JSON.stringify(valid ? { email: o.email, name: o.name, picture: o.picture } : { error: 'invalid' }));
+      return res.end(JSON.stringify(valid ? { email: o.email, name: o.name, picture: o.picture, provider: record?.provider || 'google' } : { error: 'invalid' }));
     }
 
     res.writeHead(200, { 'Content-Type': 'text/plain' });
