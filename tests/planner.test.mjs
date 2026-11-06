@@ -14,8 +14,8 @@ const sandbox = {
   structuredClone,
   userKey: email => 'users/' + crypto.createHash('sha256').update(email.toLowerCase()).digest('hex') + '.json'
 };
-vm.runInNewContext(source.slice(start, end) + '\nglobalThis.plannerTestApi = { plannerKey, emptyPlanner, plannerDate, applyPlannerAction, plannerSafeState };', sandbox);
-const { plannerKey, emptyPlanner, plannerDate, applyPlannerAction, plannerSafeState } = sandbox.plannerTestApi;
+vm.runInNewContext(source.slice(start, end) + '\nglobalThis.plannerTestApi = { plannerKey, emptyPlanner, plannerDate, plannerRecurrence, nextRecurringDate, applyPlannerAction, plannerSafeState };', sandbox);
+const { plannerKey, emptyPlanner, plannerDate, plannerRecurrence, nextRecurringDate, applyPlannerAction, plannerSafeState } = sandbox.plannerTestApi;
 
 test('planner storage key is hashed and scoped to each account', () => {
   const alice = plannerKey('Alice@example.com');
@@ -76,4 +76,32 @@ test('dates and statuses reject malformed values, safe state is bounded', () => 
   const task = applyPlannerAction(state, 'alice', { type: 'create_task', projectId: project.projectId, title: 'Task' });
   assert.throws(() => applyPlannerAction(state, 'alice', { type: 'update_task', taskId: task.taskId, status: 'admin' }));
   assert.deepEqual(Object.keys(plannerSafeState(state)).sort(), ['activity','projects','tasks','version']);
+});
+
+test('advanced task settings validate and persist without altering legacy task fields', () => {
+  const state = emptyPlanner();
+  const project = applyPlannerAction(state, 'alice', { type: 'create_project', name: 'Personal' });
+  const task = applyPlannerAction(state, 'alice', { type: 'create_task', projectId: project.projectId, title: 'Read chapter', dueDate: '2026-11-07', scheduledAt: '2026-11-07T20:00:00-05:00', category: 'School', important: true, recurrence: { frequency: 'weekly', interval: 2 }, reminderAt: '2026-11-07T19:00:00-05:00', estimatedMinutes: 35, progress: 45, notes: 'Review the diagrams' });
+  const saved = state.tasks.find(item => item.id === task.taskId);
+  assert.equal(saved.category, 'School'); assert.equal(saved.important, true); assert.equal(saved.recurrence.frequency, 'weekly'); assert.equal(saved.recurrence.interval, 2);
+  assert.equal(saved.scheduledAt, '2026-11-08T01:00:00.000Z'); assert.equal(saved.reminderAt, '2026-11-08T00:00:00.000Z');
+  assert.equal(saved.estimatedMinutes, 35); assert.equal(saved.progress, 45); assert.equal(saved.notes, 'Review the diagrams');
+  assert.throws(() => applyPlannerAction(state, 'alice', { type: 'create_task', projectId: project.projectId, title: 'Bad flag', important: 'yes' }), /true or false/i);
+  assert.throws(() => applyPlannerAction(state, 'alice', { type: 'create_task', projectId: project.projectId, title: 'Bad repeat', recurrence: { frequency: 'daily' } }), /due date/i);
+  assert.throws(() => plannerRecurrence({ frequency: 'never', interval: 1 }), /repeat schedule/i);
+  assert.throws(() => plannerRecurrence({ frequency: 'weekly', interval: 31 }), /interval/i);
+});
+
+test('recurring completion creates one fresh dated occurrence and preserves subtask checklist structure', () => {
+  const state = emptyPlanner();
+  const project = applyPlannerAction(state, 'alice', { type: 'create_project', name: 'Study' });
+  const parent = applyPlannerAction(state, 'alice', { type: 'create_task', projectId: project.projectId, title: 'Weekly review', dueDate: '2026-11-30', startDate: '2026-11-28', recurrence: { frequency: 'monthly', interval: 1 }, status: 'in_progress' });
+  const checklist = applyPlannerAction(state, 'alice', { type: 'add_checklist_item', taskId: parent.taskId, text: 'Review notes' });
+  applyPlannerAction(state, 'alice', { type: 'toggle_checklist_item', taskId: parent.taskId, itemId: checklist.itemId, done: true });
+  const done = applyPlannerAction(state, 'alice', { type: 'update_task', taskId: parent.taskId, status: 'completed', progress: 0 });
+  const next = state.tasks.find(task => task.id === done.nextTaskId);
+  assert.ok(next); assert.equal(next.status, 'todo'); assert.equal(next.progress, 0); assert.equal(next.startDate, '2026-12-28'); assert.equal(next.dueDate, '2026-12-30');
+  assert.equal(next.checklist[0].done, false); assert.notEqual(next.checklist[0].id, checklist.itemId);
+  assert.equal(next.comments.length, 0); assert.equal(next.recurrence.frequency, 'monthly');
+  assert.equal(nextRecurringDate('2026-01-31', { frequency: 'monthly', interval: 1 }), '2026-02-28');
 });
