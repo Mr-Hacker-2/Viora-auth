@@ -27,7 +27,9 @@ async function call(base, path, { method = 'GET', token, body } = {}) {
 
 test('planner attachments, recurring tasks, persistence, and account isolation use private B2 objects', async () => {
   const objects = new Map();
-  let aiMode = 'create', aiProjectId = '', aiTaskId = '';
+  let aiMode = 'create', aiProjectId = '', aiTaskId = '', releasePlannerAi;
+  let plannerAiStartedResolve;
+  const plannerAiStarted = new Promise(resolve => { plannerAiStartedResolve = resolve; });
   const b2 = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -55,6 +57,7 @@ test('planner attachments, recurring tasks, persistence, and account isolation u
     else if (aiMode === 'list') plan = { message: 'Here are your tasks.', actions: [], taskIds: (request.tasks || []).map(task => task.id) };
     else if (aiMode === 'delete') plan = { message: 'I will delete the selected task.', actions: [{ type: 'delete_task', taskId: aiTaskId }], taskIds: [] };
     else plan = { message: 'I added the requested study task.', actions: [{ type: 'create_task', projectId: aiProjectId, title: 'AI biology practice', status: 'todo', priority: 'high', dueDate: '2026-11-08', scheduledAt: '2026-11-08T22:00:00-05:00', estimatedMinutes: 30, ref: 'aiTask' }], taskIds: [] };
+    if (aiMode === 'stale-create') { plannerAiStartedResolve(); await new Promise(resolve => { releasePlannerAi = resolve; }); }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(plan) } }] }));
   });
@@ -79,6 +82,21 @@ test('planner attachments, recurring tasks, persistence, and account isolation u
     assert.equal((await call(base, '/api/planner/state')).status, 401, 'anonymous callers are rejected');
     const initial = await call(base, '/api/planner/state', { token: alice });
     assert.equal(initial.status, 200);
+    const malformedEmail = 'malformed@example.test', malformedToken = makeToken(malformedEmail, tokenSecret);
+    const malformedKey = 'planner/' + crypto.createHash('sha256').update(malformedEmail).digest('hex') + '.json';
+    const malformedRecord = Buffer.from(JSON.stringify({ version: 1, projects: 'bad-shape', tasks: [] }));
+    objects.set(malformedKey, malformedRecord);
+    assert.equal((await call(base, '/api/planner/state', { token: malformedToken })).status, 503, 'malformed stored data is reported instead of treated as a new empty Planner');
+    assert.equal((await call(base, '/api/planner/actions', { method: 'POST', token: malformedToken, body: { actions: [{ type: 'create_project', name: 'Should not overwrite' }] } })).status, 503);
+    assert.deepEqual(objects.get(malformedKey), malformedRecord, 'malformed production data is left unchanged');
+    const legacyEmail = 'legacy@example.test', legacyToken = makeToken(legacyEmail, tokenSecret);
+    const legacyKey = 'planner/' + crypto.createHash('sha256').update(legacyEmail).digest('hex') + '.json';
+    objects.set(legacyKey, Buffer.from(JSON.stringify({ version: 1, projects: [{ id: 'legacy-project', name: 'Legacy project' }], tasks: [{ id: 'legacy-task', projectId: 'legacy-project', title: 'Keep this task' }] })));
+    const legacyState = await call(base, '/api/planner/state', { token: legacyToken });
+    assert.equal(legacyState.status, 200); assert.equal(legacyState.data.tasks[0].title, 'Keep this task');
+    assert.equal(legacyState.data.projects[0].lists.length, 1, 'older projects receive a stable default list without losing tasks');
+    const migratedSave = await call(base, '/api/planner/actions', { method: 'POST', token: legacyToken, body: { actions: [{ type: 'update_task', taskId: 'legacy-task', priority: 'high' }] } });
+    assert.equal(migratedSave.status, 200); assert.equal(migratedSave.data.state.tasks[0].title, 'Keep this task');
     const project = await call(base, '/api/planner/actions', { method: 'POST', token: alice, body: { actions: [{ type: 'create_project', name: 'Study' }] } });
     const projectId = project.data.results[0].projectId;
     const created = await call(base, '/api/planner/actions', { method: 'POST', token: alice, body: { actions: [{ type: 'create_task', projectId, title: 'Review biology', dueDate: '2026-11-06', recurrence: { frequency: 'weekly', interval: 1 }, reminderAt: '2026-11-06T13:00:00.000Z', estimatedMinutes: 45, progress: 35, important: true }] } });
@@ -120,6 +138,21 @@ test('planner attachments, recurring tasks, persistence, and account isolation u
     const confirmedDelete = await call(base, '/api/planner/assistant/confirm', { method: 'POST', token: alice, body: { confirmationId: proposedDelete.data.confirmationId } });
     assert.equal(confirmedDelete.status, 200);
     assert.equal(confirmedDelete.data.state.tasks.some(item => item.id === task.id), false);
+    aiMode = 'stale-create';
+    const stalePlan = call(base, '/api/planner/assistant', { method: 'POST', token: alice, body: { command: 'Add a biology practice task', timeZone: 'America/New_York' } });
+    await plannerAiStarted;
+    const concurrentManual = await call(base, '/api/planner/actions', { method: 'POST', token: alice, body: { actions: [{ type: 'create_task', projectId, title: 'Manual during AI planning' }] } });
+    assert.equal(concurrentManual.status, 200);
+    releasePlannerAi();
+    assert.equal((await stalePlan).status, 409, 'AI refuses to overwrite changes made while it was preparing an action');
+    const afterStalePlan = await call(base, '/api/planner/state', { token: alice });
+    assert.ok(afterStalePlan.data.tasks.some(item => item.title === 'Manual during AI planning'));
+    assert.equal(afterStalePlan.data.tasks.filter(item => item.title === 'AI biology practice').length, 1);
+    const concurrentWrites = await Promise.all(['Concurrent one', 'Concurrent two'].map(title => call(base, '/api/planner/actions', { method: 'POST', token: alice, body: { actions: [{ type: 'create_task', projectId, title }] } })));
+    assert.ok(concurrentWrites.every(result => result.status === 200), 'parallel writes are serialized successfully');
+    const afterConcurrentWrites = await call(base, '/api/planner/state', { token: alice });
+    assert.ok(afterConcurrentWrites.data.tasks.some(item => item.title === 'Concurrent one'));
+    assert.ok(afterConcurrentWrites.data.tasks.some(item => item.title === 'Concurrent two'), 'parallel writes do not overwrite one another');
     const ownerHash = crypto.createHash('sha256').update('alice@example.test').digest('hex');
     assert.equal([...objects.keys()].some(key => key.startsWith('planner-files/' + ownerHash + '/' + task.id + '/')), false, 'deleting a task cleans its private files');
     assert.equal(objects.size > 0, true, 'planner JSON state remains stored in B2');
