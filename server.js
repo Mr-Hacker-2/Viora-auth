@@ -6,6 +6,7 @@ import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { buildResearchQueries, rankResearchSources, researchLimits, researchMode } from './research.js';
 import { createSseCompletionTracker } from './stream-completion.js';
 import { accountFlowDecision } from './auth-flow.js';
+import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
 const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
@@ -581,6 +582,55 @@ async function handleAdminPasswordLogin(req, res) {
   return json(res, 200, { ok: true, token, email, expiresAt });
 }
 
+/* ===== Email + password accounts =====
+   Passwords are stored only as salted scrypt hashes in the user's private record. Nothing returns or logs a password or hash,
+   including the admin dashboard, which sees the email, name, sign-up method and dates. */
+const passwordAttempts = new Map();
+async function handlePasswordAuth(req, res, mode) {
+  const origin = req.headers.origin;
+  if (SITE && origin && origin !== SITE) return json(res, 403, { error: 'Sign in from the Viora website.' });
+  if (!b2Ready()) return json(res, 503, { error: 'Account storage is not available right now. Please try again shortly.' });
+  let body;
+  try { body = await readBody(req, 4096); } catch { return json(res, 400, { error: 'Invalid request.' }); }
+  const email = normEmail(body.email), password = body.password;
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res, 400, { error: 'Enter a valid email address.' });
+  // Limit guessing per email address: 8 tries per 15 minutes, for sign-in and sign-up alike.
+  const now = Date.now(), recent = (passwordAttempts.get(email) || []).filter(at => now - at < 15 * 60e3);
+  if (recent.length >= 8) return json(res, 429, { error: 'Too many attempts. Try again in 15 minutes.' });
+  recent.push(now); passwordAttempts.set(email, recent);
+  if (passwordAttempts.size > 5000) for (const [k, v] of passwordAttempts) if (!v.some(at => now - at < 15 * 60e3)) passwordAttempts.delete(k);
+  const key = userKey(email), stamp = new Date().toISOString();
+  try {
+    const old = await getJson(key);
+    if (mode === 'signup') {
+      if (body.terms !== true) return json(res, 400, { error: 'Please accept the Terms and Privacy Policy to create your account.' });
+      const problem = checkPassword(password);
+      if (problem) return json(res, 400, { error: problem });
+      if (old) return json(res, 409, { error: old.passwordHash ? 'An account with this email already exists. Sign in instead.' : 'This email already has an account. Sign in with Google instead.' });
+      const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80) : email.split('@')[0];
+      const rec = {
+        createdAt: stamp, signedUpVia: 'signup', onboarded: false, answers: null, email, name, picture: '', provider: 'password', emailVerified: false,
+        passwordHash: await hashPassword(password), termsAcceptedAt: stamp, lastLoginAt: stamp, logins: 1
+      };
+      await putJson(key, rec);
+      await writeAdminAudit(email, 'signup_password', email, 'success');
+      return json(res, 200, { token: sign({ email, name, picture: '', exp: Date.now() + 30 * 864e5 }), email, name, picture: '' });
+    }
+    if (typeof password !== 'string' || !password || password.length > PASSWORD_MAX) return json(res, 400, { error: 'Enter your password.' });
+    if (old && !old.passwordHash) { await verifyPassword(password, DUMMY_HASH); return json(res, 401, { error: 'This email uses Google sign-in. Choose Continue with Google.' }); }
+    const ok = await verifyPassword(password, old?.passwordHash || DUMMY_HASH);
+    if (!old || !ok) { await writeAdminAudit(email, 'login_password', email, 'denied'); return json(res, 401, { error: 'Incorrect email or password.' }); }
+    if (old.status === 'suspended') { await writeAdminAudit(email, 'login_password', email, 'denied', { reason: 'suspended' }); return json(res, 403, { error: 'This account is currently unavailable. Contact Viora support for help.' }); }
+    await putJson(key, { ...old, lastLoginAt: stamp, logins: (old.logins || 0) + 1 });
+    await writeAdminAudit(email, 'login_password', email, 'success');
+    passwordAttempts.delete(email);
+    return json(res, 200, { token: sign({ email, name: old.name || '', picture: '', exp: Date.now() + 30 * 864e5 }), email, name: old.name || '', picture: '' });
+  } catch (e) {
+    console.error('password auth failed:', e?.message || e);
+    return json(res, 502, { error: 'Could not reach account storage. Please try again.' });
+  }
+}
+
 async function handleAdmin(req, res, u) {
   const auth = await adminAuth(req);
   if (auth.code) return json(res, auth.code, { error: auth.error });
@@ -633,6 +683,7 @@ async function handleAdmin(req, res, u) {
         createdAt: row.createdAt || null, lastLoginAt: row.lastLoginAt || null, logins: Number(row.logins) || 0,
         role: ADMIN_EMAILS.has(normEmail(row.email)) || row.role === 'admin' ? 'admin' : 'user',
         roleManagedBy: ADMIN_EMAILS.has(normEmail(row.email)) ? 'server environment' : 'admin',
+        provider: row.provider === 'password' ? 'password' : 'google', emailVerified: row.provider === 'password' ? row.emailVerified === true : true,
         status: row.status === 'suspended' ? 'suspended' : 'active'
       })).filter(row => !query || (row.email + ' ' + row.name).toLowerCase().includes(query))
         .sort((a, b) => String(b.lastLoginAt || '').localeCompare(String(a.lastLoginAt || '')));
@@ -768,8 +819,12 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
       await writeAdminAudit(user.email, 'login', user.email, 'denied', { reason: 'suspended' });
       return old;
     }
+    // Google has proved this person owns the email. A password set up earlier without proof of ownership is dropped, so nobody
+    // can register someone else's address first and keep a way in.
+    const { passwordHash: _dropped, ...oldKept } = old || {};
     const rec = {
-      ...(old || { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),
+      ...(old ? oldKept : { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),
+      emailVerified: true,
       email: user.email, name: user.name, picture: user.picture, provider: 'google',
       ...(requireSignupConsent && mode === 'signup' && termsAccepted ? { termsAcceptedAt: old?.termsAcceptedAt || now } : {}),
       lastLoginAt: now, logins: ((old && old.logins) || 0) + 1
@@ -1365,6 +1420,7 @@ http.createServer(async (req, res) => {
       try { const { url } = await readBody(req, 5000); return json(res, 200, textOf(await safeFetch(String(url || '')))); }
       catch (e) { return json(res, 400, { error: e.message || 'Could not read that page.' }); }
     }
+    if (req.method === 'POST' && (u.pathname === '/api/auth/signup' || u.pathname === '/api/auth/login')) return await handlePasswordAuth(req, res, u.pathname.endsWith('signup') ? 'signup' : 'signin');
     if (u.pathname === '/auth/google') {
       const site = u.searchParams.get('site') === '1';
       const ext = u.searchParams.get('ext');
