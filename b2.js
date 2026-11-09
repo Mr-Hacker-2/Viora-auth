@@ -18,7 +18,7 @@ const sha256 = (d) => crypto.createHash('sha256').update(d).digest('hex');
 const hmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
 
 const awsEncode = value => encodeURIComponent(String(value)).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
-async function request(method, key, body, queryParams = null) {
+async function request(method, key, body, queryParams = null, contentType = 'application/json') {
   if (!b2Ready()) throw new Error('Backblaze B2 is not configured');
   const host = new URL(ENDPOINT).host;
   const objectParts = key ? key.split('/') : [];
@@ -46,7 +46,7 @@ async function request(method, key, body, queryParams = null) {
     'x-amz-content-sha256': payloadHash,
     Authorization: 'AWS4-HMAC-SHA256 Credential=' + B2_KEY_ID + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature
   };
-  if (method === 'PUT') headers['Content-Type'] = 'application/json';
+  if (method === 'PUT' && contentType) headers['Content-Type'] = contentType;
   const url = ENDPOINT + path + (query ? '?' + query : '');
   return fetch(url, { method, headers, body: method === 'PUT' ? payload : undefined, signal: AbortSignal.timeout(10000) });
 }
@@ -63,6 +63,25 @@ export async function getJson(key) {
 export async function putJson(key, obj) {
   const r = await request('PUT', key, JSON.stringify(obj));
   if (!r.ok) throw new Error(`B2 PUT ${r.status}`);
+}
+
+/** Store a bounded binary object using the same private bucket and server-side key. */
+export async function putObject(key, body, contentType = 'application/octet-stream') {
+  const r = await request('PUT', key, body, null, contentType);
+  if (!r.ok) throw new Error(`B2 PUT ${r.status}`);
+}
+
+/** Read a private object. The caller must enforce per-account ownership before returning it. */
+export async function getObject(key) {
+  const r = await request('GET', key);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`B2 GET ${r.status}`);
+  return r;
+}
+
+export async function deleteObject(key) {
+  const r = await request('DELETE', key);
+  if (!r.ok && r.status !== 404) throw new Error(`B2 DELETE ${r.status}`);
 }
 
 /** One private object per account. The key is a hash, so emails never appear in file names. */
