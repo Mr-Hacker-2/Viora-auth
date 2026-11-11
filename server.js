@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import { b2Ready, getJson, putJson, userKey, listKeys, putObject, getObject, deleteObject } from './b2.js';
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
-import { buildResearchQueries, rankResearchSources, researchLimits, researchMode, sourceRecencyScore } from './research.js';
+import { buildResearchQueries, contextualResearchQuery, rankResearchSources, researchLimits, researchMode, sourceRecencyScore } from './research.js';
 import { createSseCompletionTracker } from './stream-completion.js';
 import { systemFor, heuristicIntent, modelIntent, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
 import { accountFlowDecision } from './auth-flow.js';
@@ -880,7 +880,7 @@ async function webSearchOne(query, requestSignal = null) {
     : /\b(trip|travel|itinerary|tourism|vacation|visit|things to do|attractions|hotel|flight)\b/i.test(q) ? 'travel'
     : /\b(code|coding|programming|javascript|python|api|debug|error|library|framework|documentation)\b/i.test(q) ? 'technical'
     : 'general';
-  const stop = new Set(('a an the to for of in on at and or but with from by is are was were be plan make create help me my your our their this that what how when where why can could would should please today latest recent best good guide official trip travel itinerary vacation visit things attractions city country find search information about').split(' '));
+  const stop = new Set(('a an the to for of in on at and or but with from by is are was were be plan make create help me my your our their this that what how when where why can could would should please today latest recent best good guide official trip travel itinerary vacation visit things attractions city country find search information about book books author authors internet web online').split(' '));
   const tokens = (s) => [...new Set(String(s || '').toLowerCase().replace(/https?:\/\/\S+/g, ' ').replace(/[^a-z0-9]+/g, ' ').split(/\s+/).filter(w => w.length > 2 && !stop.has(w)))];
   const queryTokens = tokens(q);
   const topicTokens = queryTokens.filter(w => !/^\d+$/.test(w));
@@ -965,7 +965,6 @@ async function webSearchOne(query, requestSignal = null) {
   const endpoints = [];
   if (intent === 'news') for (const query of uniqueQueries) endpoints.push('https://news.google.com/rss/search?q=' + encodeURIComponent(query) + '&hl=en-US&gl=US&ceid=US:en');
   for (const query of uniqueQueries) endpoints.push('https://www.bing.com/search?format=rss&q=' + encodeURIComponent(query));
-  if (intent !== 'news') for (const query of uniqueQueries) endpoints.push('https://news.google.com/rss/search?q=' + encodeURIComponent(query) + '&hl=en-US&gl=US&ceid=US:en');
   // Query the first providers concurrently. Sequential RSS requests made one slow
   // provider delay every answer, even when another provider had useful results.
   const primary = [...new Set(endpoints)].slice(0, 3);
@@ -1165,7 +1164,7 @@ async function chat(req, res, user) {
   const activeResearchMode = b.assistant === 'search' ? researchMode(b.researchMode) : 'quick';
   const searchQueries = [];
   if (b.web === true) {
-    const query = [...b.messages].reverse().find((m) => m && m.role !== 'assistant' && String(m.content || '').trim())?.content || '';
+    const query = contextualResearchQuery(b.messages);
     searchQueries.push(...buildResearchQueries(query, activeResearchMode).slice(0, researchLimits(activeResearchMode).queryLimit));
     progress('search', activeResearchMode === 'deep' ? 'Searching ' + searchQueries.length + ' focused queries' : 'Searching the web');
     const searchStartedAt = Date.now();

@@ -1,6 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResearchQueries, rankResearchSources, researchLimits, researchMode, sourceRecencyScore, sourceType } from '../research.js';
+import { buildResearchQueries, contextualResearchQuery, rankResearchSources, researchLimits, researchMode, sourceRecencyScore, sourceType } from '../research.js';
+
+test('a follow-up web search resolves a book reference from the user conversation', () => {
+  const messages = [
+    { role: 'user', content: 'I will be meeting the author of Fancy bear goes phishing I need goo questions to ask.' },
+    { role: 'assistant', content: 'Here are some questions about Fancy Bear Goes Phishing.' },
+    { role: 'user', content: 'I want him to feel like I read it.' },
+    { role: 'assistant', content: 'Try a simple question about the book.' },
+    { role: 'user', content: 'Search the internet about the book.' }
+  ];
+  const query = contextualResearchQuery(messages);
+  assert.match(query, /Fancy bear goes phishing/);
+  assert.match(query, /Search the internet about the book/);
+  assert.ok(query.length <= 500);
+});
+
+test('standalone searches stay unchanged and assistant text is not used as topic context', () => {
+  assert.equal(contextualResearchQuery([{ role: 'user', content: 'Search the latest battery news.' }]), 'Search the latest battery news.');
+  assert.equal(contextualResearchQuery([
+    { role: 'assistant', content: 'Fancy Bear Goes Phishing is a book.' },
+    { role: 'user', content: 'Search the internet about the book.' }
+  ]), 'Search the internet about the book.');
+});
 
 test('quick search uses one bounded query and handles empty input', () => {
   assert.deepEqual(buildResearchQueries('  current   battery news  ', 'quick'), ['current battery news']);

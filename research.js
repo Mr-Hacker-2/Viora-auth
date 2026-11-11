@@ -1,5 +1,29 @@
 export const researchMode = value => value === 'deep' ? 'deep' : 'quick';
 
+export function contextualResearchQuery(messages) {
+  const history = Array.isArray(messages) ? messages : [];
+  let latestIndex = -1;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i]?.role === 'user' && String(history[i].content || '').trim()) {
+      latestIndex = i;
+      break;
+    }
+  }
+  if (latestIndex < 0) return '';
+
+  const query = String(history[latestIndex].content).replace(/\s+/g, ' ').trim().slice(0, 500);
+  if (!/\b(?:book|novel)\b/i.test(query)) return query;
+
+  const context = history.slice(0, latestIndex).reverse().find(message =>
+    message?.role === 'user' && /\b(?:book|novel|author|writer)\b/i.test(String(message.content || '').trim())
+  );
+  if (!context) return query;
+
+  const contextLimit = Math.max(0, 499 - query.length);
+  const topicContext = String(context.content).replace(/\s+/g, ' ').trim().slice(0, contextLimit);
+  return topicContext ? `${topicContext} ${query}` : query;
+}
+
 export function sourceRecencyScore(publishedAt, now = Date.now()) {
   const timestamp = Date.parse(String(publishedAt || ''));
   if (!Number.isFinite(timestamp)) return 0;
