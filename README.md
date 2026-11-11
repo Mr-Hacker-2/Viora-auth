@@ -34,10 +34,16 @@ authenticated user. Disconnecting the chat aborts active search, page retrieval,
 The response includes short retrieved-page excerpts for expandable source previews; provider page
 text remains bounded before it is sent to the model or returned to the browser.
 
+Book-content searches also query Google Books and accept only records whose title matches the requested
+work. General search providers use stricter topic matching so a single generic word does not admit an
+unrelated result. The response distinguishes provider failure from a completed search with no relevant
+sources, reports page-read failures, and says how many retrieved records were supplied to the model.
+Search errors are included in the streamed research metadata and answer context.
+
 Ranking combines topic overlap with modest government/academic/documentation domain hints. It is a
-search heuristic, not a source-quality judgment. Citation numbers are tied to returned sources, but
-the API does not independently verify each claim against the cited page. Do not report claim-level
-fact verification as complete.
+search heuristic, not a source-quality judgment. Citation numbers point to returned source URLs, but
+the API does not independently verify each claim against the cited page. Do not report claim-level fact
+verification as complete.
 ## Admin control center
 
 The static website includes a protected `/admin/` control center. It does not trust browser-stored roles; every `/api/admin/*` request verifies the signed Viora session and then checks the server-side `ADMIN_EMAILS` bootstrap list or the account's stored admin role. Set `ADMIN_EMAILS` in Render to one or more comma-separated owner email addresses before using it. If unset, no first administrator is granted. The `/admin/` page also supports a server-verified password sign-in: set `ADMIN_ACCESS_PASSWORD` in Render to a unique secret (never put it in the website code). The password route is rate limited, compares the secret in constant time, issues a 12-hour signed token for the first `ADMIN_EMAILS` identity, and records successful/denied attempts when B2 is configured. The browser stores this token only for the current tab session. If either variable is missing, password sign-in fails closed.
@@ -45,4 +51,3 @@ The static website includes a protected `/admin/` control center. It does not tr
 Admin account search, role changes, suspension/reactivation, current-process request counts, model configuration, health checks, and audit events require Backblaze B2 to be configured. Role/status changes are confirmed in the UI and audit logged. Bootstrap emails cannot be changed in the UI. A suspended account is denied on subsequent authenticated requests; the server's short account-status cache may take up to 10 seconds to refresh.
 
 The dashboard reports conversation totals, uploaded-file totals, provider connectivity, billing cost, historical request charts, and runtime feature toggles as unavailable because the current services do not provide those data or controls. Provider-key indicators show only whether a server key is configured and never return the secret.
-

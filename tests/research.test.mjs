@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResearchQueries, contextualResearchQuery, rankResearchSources, researchLimits, researchMode, sourceRecencyScore, sourceType } from '../research.js';
+import { buildResearchQueries, contextualResearchQuery, extractBookTitle, rankResearchSources, researchLimits, researchMode, sourceRecencyScore, sourceType } from '../research.js';
 
 test('a follow-up web search resolves a book reference from the user conversation', () => {
   const messages = [
@@ -27,6 +27,21 @@ test('standalone searches stay unchanged and assistant text is not used as topic
 test('quick search uses one bounded query and handles empty input', () => {
   assert.deepEqual(buildResearchQueries('  current   battery news  ', 'quick'), ['current battery news']);
   assert.deepEqual(buildResearchQueries('  ', 'deep'), []);
+});
+
+test('book-content searches preserve the exact title and add focused book terms', () => {
+  const query = 'Search the internet for the content of Fancy Bear Goes Phishing.';
+  assert.equal(extractBookTitle(query), 'Fancy Bear Goes Phishing');
+  assert.deepEqual(buildResearchQueries(query), ['"Fancy Bear Goes Phishing" book contents chapters']);
+});
+
+test('book references in a conversation summary survive assistant switching', () => {
+  const query = contextualResearchQuery(
+    [{ role: 'user', content: 'Search the internet about the book.' }],
+    'User: I will meet the author of Fancy bear goes phishing I need questions to ask.\nViora: Here are some questions.'
+  );
+  assert.match(query, /"Fancy bear goes phishing"/);
+  assert.match(buildResearchQueries(query)[0], /Fancy bear goes phishing/i);
 });
 
 test('deep research expands into at most three distinct focused searches', () => {

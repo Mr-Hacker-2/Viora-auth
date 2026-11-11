@@ -1,6 +1,27 @@
 export const researchMode = value => value === 'deep' ? 'deep' : 'quick';
 
-export function contextualResearchQuery(messages) {
+const normalizeTitle = value => String(value || '').normalize('NFKC').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+const cleanBookTitle = value => String(value || '').replace(/\s+/g, ' ').replace(/^[\s"'“”‘’]+|[\s"'“”‘’.,!?;:]+$/g, '').trim().slice(0, 160);
+
+export function extractBookTitle(text) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  const patterns = [
+    /["“]([^"”]{3,160})["”]/,
+    /\b(?:content|contents|chapter|chapters)\s+(?:of|for|in)\s+(.+?)(?:[.!?]|$)/i,
+    /\b(?:author|writer)\s+of\s+(.+?)(?:\s+(?:and\s+i|i\s+(?:need|want|am)|please|can\s+you|could\s+you)\b|[.!?]|$)/i,
+    /\b(?:book|novel)\s+(?:called|named|titled)\s+(.+?)(?:[.!?]|$)/i
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match) {
+      const title = cleanBookTitle(match[1]);
+      if (title) return title;
+    }
+  }
+  return '';
+}
+
+export function contextualResearchQuery(messages, summary = '') {
   const history = Array.isArray(messages) ? messages : [];
   let latestIndex = -1;
   for (let i = history.length - 1; i >= 0; i--) {
@@ -12,16 +33,16 @@ export function contextualResearchQuery(messages) {
   if (latestIndex < 0) return '';
 
   const query = String(history[latestIndex].content).replace(/\s+/g, ' ').trim().slice(0, 500);
-  if (!/\b(?:book|novel)\b/i.test(query)) return query;
+  if (!/\b(?:book|novel|chapter|contents?)\b/i.test(query)) return query;
 
-  const context = history.slice(0, latestIndex).reverse().find(message =>
-    message?.role === 'user' && /\b(?:book|novel|author|writer)\b/i.test(String(message.content || '').trim())
-  );
-  if (!context) return query;
+  const priorUserText = [
+    ...history.slice(0, latestIndex).filter(message => message?.role === 'user').map(message => String(message.content || '')),
+    ...String(summary || '').split(/\n(?=(?:User|Viora):\s)/).filter(row => /^User:\s/i.test(row)).map(row => row.replace(/^User:\s*/i, ''))
+  ];
+  const title = priorUserText.reverse().map(extractBookTitle).find(Boolean);
+  if (!title) return query;
 
-  const contextLimit = Math.max(0, 499 - query.length);
-  const topicContext = String(context.content).replace(/\s+/g, ' ').trim().slice(0, contextLimit);
-  return topicContext ? `${topicContext} ${query}` : query;
+  return `"${title}" ${query}`.slice(0, 500);
 }
 
 export function sourceRecencyScore(publishedAt, now = Date.now()) {
@@ -37,10 +58,12 @@ export function sourceRecencyScore(publishedAt, now = Date.now()) {
   return 0;
 }
 
-/** A bounded set of query variations; the original question is always searched first. */
+/** A bounded set of query variations; book-title requests are narrowed to the requested work. */
 export function buildResearchQueries(question, mode = 'quick') {
   const q = String(question || '').replace(/\s+/g, ' ').trim().slice(0, 500);
   if (!q) return [];
+  const title = /\b(?:book|novel|chapter|contents?)\b/i.test(q) ? extractBookTitle(q) : '';
+  if (title) return [`"${title}" book contents chapters`];
   if (researchMode(mode) === 'quick') return [q];
   const lower = q.toLowerCase();
   const modifier = /\b(documentation|api|library|framework|programming|code|javascript|python|software)\b/.test(lower)
