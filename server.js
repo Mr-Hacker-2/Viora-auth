@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import { b2Ready, getJson, putJson, userKey, listKeys, putObject, getObject, deleteObject } from './b2.js';
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
-import { buildResearchQueries, rankResearchSources, researchLimits, researchMode } from './research.js';
+import { buildResearchQueries, rankResearchSources, researchLimits, researchMode, sourceRecencyScore } from './research.js';
 import { createSseCompletionTracker } from './stream-completion.js';
 import { systemFor, heuristicIntent, modelIntent, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
 import { accountFlowDecision } from './auth-flow.js';
@@ -898,7 +898,7 @@ async function webSearchOne(query, requestSignal = null) {
       if (/\b(documentation|github|developer|api|reference|tutorial|release notes|stackoverflow|mozilla)\b/i.test(text)) points += 3;
     } else if (intent === 'news') {
       if (/\b(dictionary|definition|thesaurus|word meaning)\b/i.test(text)) points -= 10;
-      if (item.publishedAt) points += 1;
+      points += sourceRecencyScore(item.publishedAt);
     }
     return points;
   };

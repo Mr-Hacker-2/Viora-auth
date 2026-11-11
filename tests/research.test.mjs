@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResearchQueries, rankResearchSources, researchLimits, researchMode, sourceType } from '../research.js';
+import { buildResearchQueries, rankResearchSources, researchLimits, researchMode, sourceRecencyScore, sourceType } from '../research.js';
 
 test('quick search uses one bounded query and handles empty input', () => {
   assert.deepEqual(buildResearchQueries('  current   battery news  ', 'quick'), ['current battery news']);
@@ -52,4 +52,29 @@ test('ranking deduplicates URLs, filters unsafe links, and uses relevance with m
 
 test('ranking honors a non-negative result limit', () => {
   assert.deepEqual(rankResearchSources([{ url: 'https://example.com', relevanceScore: 1 }], 0), []);
+});
+
+test('news freshness favors recent publication dates and handles stale or invalid dates', () => {
+  const now = Date.parse('2026-11-11T12:00:00Z');
+  assert.ok(sourceRecencyScore('2026-11-11T00:00:00Z', now) > sourceRecencyScore('2026-11-01T00:00:00Z', now));
+  assert.ok(sourceRecencyScore('2026-01-01T00:00:00Z', now) < 0);
+  assert.equal(sourceRecencyScore('not a date', now), 0);
+  assert.ok(sourceRecencyScore('2026-11-12T12:00:00Z', now) < 0);
+});
+
+test('ranked results prefer publisher diversity but backfill when sources are limited', () => {
+  const sources = [
+    ...[30, 29, 28].map((relevanceScore, index) => ({ url: `https://one.example/story-${index}`, relevanceScore })),
+    ...[27, 26, 25].map((relevanceScore, index) => ({ url: `https://two.example/story-${index}`, relevanceScore })),
+    { url: 'https://three.example/story', relevanceScore: 24 }
+  ];
+  const ranked = rankResearchSources(sources, 5);
+  const counts = ranked.reduce((result, source) => {
+    const hostname = new URL(source.url).hostname;
+    result[hostname] = (result[hostname] || 0) + 1;
+    return result;
+  }, {});
+  assert.equal(ranked.length, 5);
+  assert.ok(Object.values(counts).every(count => count <= 2));
+  assert.equal(rankResearchSources(sources.slice(0, 3), 5).length, 3);
 });

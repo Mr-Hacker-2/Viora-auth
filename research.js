@@ -1,5 +1,18 @@
 export const researchMode = value => value === 'deep' ? 'deep' : 'quick';
 
+export function sourceRecencyScore(publishedAt, now = Date.now()) {
+  const timestamp = Date.parse(String(publishedAt || ''));
+  if (!Number.isFinite(timestamp)) return 0;
+  const ageHours = (now - timestamp) / 3600000;
+  if (ageHours < -12) return -6;
+  if (ageHours < 0) return 0;
+  if (ageHours <= 24) return 8;
+  if (ageHours <= 24 * 7) return 5;
+  if (ageHours <= 24 * 30) return 2;
+  if (ageHours > 24 * 180) return -4;
+  return 0;
+}
+
 /** A bounded set of query variations; the original question is always searched first. */
 export function buildResearchQueries(question, mode = 'quick') {
   const q = String(question || '').replace(/\s+/g, ' ').trim().slice(0, 500);
@@ -45,9 +58,16 @@ export function rankResearchSources(sources, limit = 6) {
     } catch {}
   }
   const weight = { government: 2, academic: 2, documentation: 1, other: 0 };
-  return [...unique.values()]
-    .sort((a, b) => ((Number(b.relevanceScore) || 0) + weight[b.sourceType]) - ((Number(a.relevanceScore) || 0) + weight[a.sourceType]))
-    .slice(0, Math.max(0, limit));
+  const sorted = [...unique.values()]
+    .sort((a, b) => ((Number(b.relevanceScore) || 0) + weight[b.sourceType]) - ((Number(a.relevanceScore) || 0) + weight[a.sourceType]));
+  const max = Math.max(0, Math.floor(Number(limit) || 0)), selected = [], deferred = [], domains = new Map();
+  for (const source of sorted) {
+    const domain = new URL(source.url).hostname.replace(/^www\./, '').toLowerCase();
+    const count = domains.get(domain) || 0;
+    if (count >= 2) deferred.push(source);
+    else { selected.push(source); domains.set(domain, count + 1); }
+  }
+  return [...selected, ...deferred].slice(0, max);
 }
 
 export function researchLimits(mode) {
