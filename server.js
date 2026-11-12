@@ -7,6 +7,7 @@ import { contextualResearchQuery, heuristicResearchDecision, researchLimits, res
 import { buildResearchContext, searchWeb } from './web-search.js';
 import { createSseCompletionTracker } from './stream-completion.js';
 import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
+import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, createReasoningStripper, stripReasoningFromEvent } from './think.js';
 import { accountFlowDecision } from './auth-flow.js';
 import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
 
@@ -18,7 +19,7 @@ const ADMIN_EMAILS = new Set(String(process.env.ADMIN_EMAILS || '').split(',').m
 const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || '';
 const adminLoginAttempts = new Map();
 const normEmail = value => String(value || '').trim().toLowerCase();
-const runtimeMetrics = { startedAt: new Date().toISOString(), aiRequests: 0, byAssistant: Object.create(null) };
+const runtimeMetrics = { startedAt: new Date().toISOString(), aiRequests: 0, thinkRequests: 0, byAssistant: Object.create(null) };
 const REDIRECT = `${BASE}/auth/callback`;
 
 if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !TOKEN_SECRET) {
@@ -673,7 +674,7 @@ async function handleAdmin(req, res, u) {
       const createdWeek = rows.filter(row => Date.parse(row.createdAt || '') >= now - 7 * day).length;
       return json(res, 200, {
         users: { total: rows.length, complete: !truncated, newToday: truncated ? null : createdToday, newWeek: truncated ? null : createdWeek, recentSignIns30d: truncated ? null : recentUsers },
-        ai: { requestsSince: runtimeMetrics.startedAt, submittedRequests: runtimeMetrics.aiRequests, byAssistant: runtimeMetrics.byAssistant },
+        ai: { requestsSince: runtimeMetrics.startedAt, submittedRequests: runtimeMetrics.aiRequests, thinkRequests: runtimeMetrics.thinkRequests, byAssistant: runtimeMetrics.byAssistant },
         unavailable: { conversations: 'Chat histories stay in each user’s browser and are not collected by the server.', uploadedFiles: 'Uploads are processed for a request and are not stored as an admin metric.', estimatedCost: 'Provider billing data is not available to this server.' },
         history: truncated ? 'User totals are a lower bound because the account listing reached its safety limit.' : null
       });
@@ -919,7 +920,7 @@ async function reviewAnswer(key, model, question, draft, sources = [], attachmen
 async function chat(req, res, user) {
   const b = await readBody(req, 16e6), a = ASSIST[b.assistant];
   if (!a || !Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: 'Bad request.' });
-  const dupKey = user.email + '|' + b.assistant + '|' + crypto.createHash('sha1').update(JSON.stringify(b.messages.slice(-3).map(m => [m && m.role, String(m && m.content || '').slice(0, 2000)]))).digest('hex');
+  const dupKey = user.email + '|' + b.assistant + (b.think === true ? '|think|' : '|') + crypto.createHash('sha1').update(JSON.stringify(b.messages.slice(-3).map(m => [m && m.role, String(m && m.content || '').slice(0, 2000)]))).digest('hex');
   const dupStarted = inflightChats.get(dupKey);
   if (dupStarted && Date.now() - dupStarted.at < 4000) return json(res, 409, { error: 'This message is already being answered.' });
   const dupEntry = { at: Date.now() };
@@ -941,7 +942,7 @@ async function chat(req, res, user) {
     }
   };
   res.once('close', markClientGone);
-  const key = process.env[`NVIDIA_${a.env}_KEY`] || process.env.NVIDIA_API_KEY;
+  let key = process.env[`NVIDIA_${a.env}_KEY`] || process.env.NVIDIA_API_KEY;
   if (!key) return json(res, 500, { error: `The ${b.assistant} assistant has no API key on the server yet.` });
   const imageInputs = Array.isArray(b.images)
     ? b.images.filter((x) => typeof x === 'string' && /^data:image\/(?:jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=]+$/i.test(x) && x.length <= 5_000_000).slice(0, 12)
@@ -957,6 +958,11 @@ async function chat(req, res, user) {
   const videoRequested = !!videoInput;
   const audioRequested = !!audioInput;
   const visionRequested = imageInputs.length > 0;
+  /* Think Mode (think.js): decided once per request from this request's own body; nothing is remembered between requests. */
+  const thinkPlan = planThink({ requested: b.think === true, assistant: b.assistant, assistants: ASSIST, multimodal: videoRequested || audioRequested || visionRequested });
+  const thinkBoost = thinkPlan.applied && !videoRequested && !audioRequested && !visionRequested;
+  if (thinkPlan.requested) runtimeMetrics.thinkRequests++;
+  if (thinkPlan.upgraded) key = process.env[`NVIDIA_${ASSIST[thinkPlan.lane].env}_KEY`] || process.env.NVIDIA_API_KEY || key;
   const msgs = b.messages.slice(-24).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, 20000) }));
   const plainMsgs = msgs.map((m) => ({ role: m.role, content: m.content }));
   const lastUserText = String([...plainMsgs].reverse().find((m) => m.role === 'user')?.content || '');
@@ -998,6 +1004,7 @@ async function chat(req, res, user) {
     }
   }
   let sys = a.sys;
+  if (thinkPlan.applied) sys += '\n\n' + THINK_GUIDE;
   if (visionRequested) {
     sys += '\n\nIMAGE UNDERSTANDING REQUIRED: The latest user message contains one or more attached images. Inspect the actual visual content before answering. For a question like “What is this?”, identify the most likely visible object or scene, describe the visual evidence briefly, and state uncertainty only where the image genuinely does not support a confident identification. Do not ask the user to clarify merely because they wrote “this”; that refers to the attached image. Never claim you cannot see the image when image data is present. If text is visible, read it when relevant. Do not invent brand, model, or details that are not visible.';
   }
@@ -1130,7 +1137,7 @@ async function chat(req, res, user) {
     ? [omni]
     : visionRequested
       ? [omni, 'meta/llama-3.2-90b-vision-instruct']
-      : [...new Set(a.chain)];
+      : [...new Set(thinkPlan.chain)];
   let lastProviderStatus = 0;
   let selectedModel = '';
   // Keep fallback attempts bounded: a slow first model must not make every
@@ -1144,7 +1151,7 @@ async function chat(req, res, user) {
       const providerCtl = new AbortController();
       const providerTimer = setTimeout(
         () => providerCtl.abort(),
-        videoRequested || audioRequested || visionRequested ? 45000 : 12000
+        videoRequested || audioRequested || visionRequested ? 45000 : thinkBoost ? THINK_LIMITS.providerHeaderMs : 12000
       );
       let attempt;
       try {
@@ -1154,8 +1161,8 @@ async function chat(req, res, user) {
           body: JSON.stringify({
             model,
             messages: [{ role: 'system', content: sys }, ...msgs],
-            temperature: Number.isFinite(b.temperature) ? Math.max(0, Math.min(2, b.temperature)) : a.t,
-            max_tokens: Number.isInteger(b.max_tokens) ? Math.max(16, Math.min(3072, b.max_tokens)) : (videoRequested || audioRequested ? 3072 : b.assistant === 'flash' ? 2048 : 3072),
+            temperature: Number.isFinite(b.temperature) ? Math.max(0, Math.min(2, b.temperature)) : thinkTemperature(a.t, thinkPlan.applied),
+            max_tokens: Number.isInteger(b.max_tokens) ? Math.max(16, Math.min(thinkBoost ? THINK_LIMITS.maxTokens : 3072, b.max_tokens)) : (videoRequested || audioRequested ? 3072 : thinkBoost ? THINK_LIMITS.maxTokens : b.assistant === 'flash' ? 2048 : 3072),
             ...(videoRequested || audioRequested || visionRequested ? { chat_template_kwargs: { enable_thinking: false } } : {}),
             ...(videoRequested ? { mm_processor_kwargs: { use_audio_in_video: true } } : {}),
             stream: true
@@ -1204,9 +1211,10 @@ async function chat(req, res, user) {
   }
   const verifyAnswer = shouldReviewResearchAnswer({
     hasSearchEvidence: shouldResearch && sources.length > 0,
-    requestedReview: !shouldResearch && b.intelligence?.review === true,
+    requestedReview: !shouldResearch && (b.intelligence?.review === true || thinkPlan.applied),
     hasMultimodalInput: videoRequested || audioRequested || visionRequested
   });
+  if (thinkPlan.requested && !res.destroyed) res.write('data: ' + JSON.stringify({ viora_think: thinkReport(thinkPlan, { model: selectedModel, review: verifyAnswer }) }) + '\n\n');
   const write = async chunk => {
     if (res.destroyed || clientGone) return false;
     if (!res.write(chunk)) await new Promise(resolve => res.once('drain', resolve));
@@ -1216,12 +1224,16 @@ async function chat(req, res, user) {
     if (!verifyAnswer) {
       const completion = createSseCompletionTracker();
       const decoder = new TextDecoder();
+      const stripper = thinkPlan.applied ? createReasoningStripper() : null;
       for await (const chunk of r.body) {
         if (res.destroyed || clientGone) break;
-        completion.push(decoder.decode(chunk, { stream: true }));
-        if (!res.write(chunk)) await new Promise(resolve => res.once('drain', resolve));
+        const piece = decoder.decode(chunk, { stream: true });
+        completion.push(piece);
+        const forward = stripper ? stripper.push(piece) : chunk;
+        if (forward.length && !res.write(forward)) await new Promise(resolve => res.once('drain', resolve));
       }
       completion.push(decoder.decode());
+      if (stripper && !res.destroyed && !clientGone) { const rest = stripper.flush(); if (rest) res.write(rest); }
       if (res.destroyed || clientGone) return;
       if (!completion.finish()) {
         reportProgress('incomplete', 'The AI provider stream ended before a completion marker');
@@ -1252,7 +1264,9 @@ async function chat(req, res, user) {
         } catch {}
       }
       if (isDone) return;
-      return write(event + separator);
+      const outEvent = thinkPlan.applied ? stripReasoningFromEvent(event) : event;
+      if (!outEvent) return true;
+      return write(outEvent + separator);
     };
     for await (const chunk of r.body) {
       if (res.destroyed || clientGone) break;
@@ -1297,7 +1311,7 @@ async function chat(req, res, user) {
           ];
           let repaired = null;
           const repairCtl = new AbortController();
-          const repairTimer = setTimeout(() => repairCtl.abort(), 12000);
+          const repairTimer = setTimeout(() => repairCtl.abort(), thinkBoost ? THINK_LIMITS.providerHeaderMs : 12000);
           try {
             repaired = await fetch(`${NV}/chat/completions`, {
               method: 'POST',
@@ -1305,8 +1319,8 @@ async function chat(req, res, user) {
               body: JSON.stringify({
                 model: retryModel,
                 messages: [{ role: 'system', content: sys + '\n\nSELF-CORRECTION: Recheck the answer against the user’s request. Fix material errors or omissions, preserve supported details, and do not invent sources or claim independent verification.' }, ...repairMessages],
-                temperature: a.t,
-                max_tokens: b.assistant === 'flash' ? 2048 : 3072,
+                temperature: thinkTemperature(a.t, thinkPlan.applied),
+                max_tokens: thinkBoost ? THINK_LIMITS.maxTokens : b.assistant === 'flash' ? 2048 : 3072,
                 stream: true
               }),
               signal: AbortSignal.any([repairCtl.signal, requestCtl.signal])
@@ -1317,12 +1331,16 @@ async function chat(req, res, user) {
             await write('data: ' + JSON.stringify({ viora_retry: { model: retryModel } }) + '\n\n');
             const repairCompletion = createSseCompletionTracker();
             const repairDecoder = new TextDecoder();
+            const repairStripper = thinkPlan.applied ? createReasoningStripper() : null;
             for await (const chunk of repaired.body) {
               if (res.destroyed || clientGone) break;
-              repairCompletion.push(repairDecoder.decode(chunk, { stream: true }));
-              if (!res.write(chunk)) await new Promise(resolve => res.once('drain', resolve));
+              const piece = repairDecoder.decode(chunk, { stream: true });
+              repairCompletion.push(piece);
+              const forward = repairStripper ? repairStripper.push(piece) : chunk;
+              if (forward.length && !res.write(forward)) await new Promise(resolve => res.once('drain', resolve));
             }
             repairCompletion.push(repairDecoder.decode());
+            if (repairStripper && !res.destroyed && !clientGone) { const rest = repairStripper.flush(); if (rest) res.write(rest); }
             if (!repairCompletion.finish()) {
               reportProgress('incomplete', 'The repair stream ended before a completion marker');
               await write('data: ' + JSON.stringify({ viora_incomplete: { message: 'The improved answer stream ended before completion.' } }) + '\n\n');
