@@ -1,4 +1,4 @@
-import { buildResearchQueries, extractBookTitle, rankResearchSources, researchLimits, sourceRecencyScore } from './research.js';
+import { buildResearchQueries, extractBookTitle, rankResearchSources, researchLimits, researchMode, sourceRecencyScore } from './research.js';
 
 const STOP_WORDS = new Set(('a an the to for of in on at and or but with from by is are was were be plan make create help me my your our their this that what how when where why can could would should please today latest recent best good guide official trip travel itinerary vacation visit things attractions city country find search information about book books author authors internet web online contents chapters').split(' '));
 const words = value => [...new Set(String(value || '').toLowerCase().replace(/https?:\/\/\S+/g, ' ').replace(/[^a-z0-9]+/g, ' ').split(/\s+/).filter(word => word.length > 2 && !STOP_WORDS.has(word)))];
@@ -146,6 +146,9 @@ function errorText(error) {
 export async function searchWeb(query, mode = 'quick', requestSignal = null, fetchImpl = globalThis.fetch) {
   const limits = researchLimits(mode);
   const queries = buildResearchQueries(query, mode).slice(0, limits.queryLimit);
+  const refinementQuery = researchMode(mode) === 'quick'
+    ? buildResearchQueries(query, 'deep').find(candidate => !queries.includes(candidate))
+    : '';
   const attempts = [];
   const collected = [];
   if (queries.length) {
@@ -219,6 +222,7 @@ export async function searchWeb(query, mode = 'quick', requestSignal = null, fet
         }
       }
       if (relevant.length) collected.push(...relevant);
+      else if (researchMode(mode) === 'quick' && queries.length === 1 && refinementQuery) queries.push(refinementQuery);
     }
   }
 

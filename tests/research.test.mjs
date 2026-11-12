@@ -1,6 +1,56 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResearchQueries, contextualResearchQuery, extractBookTitle, rankResearchSources, researchLimits, researchMode, sourceRecencyScore, sourceType } from '../research.js';
+import { readFile } from 'node:fs/promises';
+import { buildResearchQueries, contextualResearchQuery, extractBookTitle, heuristicResearchDecision, rankResearchSources, researchLimits, researchMode, researchReviewRequiresRetry, shouldReviewResearchAnswer, sourceRecencyScore, sourceType } from '../research.js';
+
+test('research need is decided from the request, not the selected assistant', () => {
+  for (const assistant of ['flash', 'search', 'math']) {
+    assert.equal(heuristicResearchDecision([{ role: 'user', content: 'Explain photosynthesis' }], { assistant, task: 'explain' }).decision, 'direct', assistant);
+    assert.equal(heuristicResearchDecision([{ role: 'user', content: 'Who wrote Fancy Bear Goes Phishing?' }], { assistant }).decision, 'model', assistant);
+    assert.equal(heuristicResearchDecision([{ role: 'user', content: 'What is the latest AI regulation news?' }], { assistant }).decision, 'search', assistant);
+    assert.equal(heuristicResearchDecision([{ role: 'user', content: 'Search the internet for the contents of Fancy Bear Goes Phishing.' }], { assistant }).decision, 'search', assistant);
+  }
+});
+
+test('greetings and task-focused requests skip research, while attachment references are assessed in context', () => {
+  assert.equal(heuristicResearchDecision([{ role: 'user', content: 'Hi, how are you?' }]).decision, 'direct');
+  assert.equal(heuristicResearchDecision([{ role: 'user', content: 'Why does this Python loop never end?' }], { task: 'fix' }).decision, 'direct');
+  assert.equal(heuristicResearchDecision([{ role: 'user', content: 'What is the latest figure in this report?' }], { hasPage: true }).decision, 'model');
+  assert.equal(heuristicResearchDecision([{ role: 'user', content: 'Find recent studies on sleep' }], { enabled: false }).decision, 'disabled');
+  assert.equal(heuristicResearchDecision([{ role: 'user', content: 'Rewrite this paragraph' }], { assistant: 'humanize' }).decision, 'direct');
+});
+
+test('all answers with retrieved search evidence are reviewed even when the client does not request review', () => {
+  assert.equal(shouldReviewResearchAnswer({ hasSearchEvidence: true }), true);
+  assert.equal(shouldReviewResearchAnswer({ hasSearchEvidence: false, requestedReview: false }), false);
+  assert.equal(shouldReviewResearchAnswer({ requestedReview: true }), true);
+  assert.equal(shouldReviewResearchAnswer({ requestedReview: true, hasMultimodalInput: true }), false);
+  assert.equal(shouldReviewResearchAnswer({ hasSearchEvidence: true, hasMultimodalInput: true }), true);
+});
+
+test('research review honors explicit retry decisions as well as low quality scores', () => {
+  assert.equal(researchReviewRequiresRetry({ score: 8, retry: true }), true);
+  assert.equal(researchReviewRequiresRetry({ score: 5, retry: false }), true);
+  assert.equal(researchReviewRequiresRetry({ score: 8, retry: false }), false);
+  assert.equal(researchReviewRequiresRetry({ retry: 'true' }), false);
+});
+
+test('the chat server reviews source-backed answers and flags browsing contradictions', async () => {
+  const server = await readFile(new URL('../server.js', import.meta.url), 'utf8');
+  assert.match(server, /hasSearchEvidence:\s*shouldResearch && sources\.length > 0/);
+  assert.match(server, /retry: researchReviewRequiresRetry\(parsed\)/);
+  assert.match(server, /browsing is unavailable or that no search was performed is a clear factual contradiction/);
+  assert.match(server, /sources do not contain, the draft must state that limitation and must not invent details/);
+});
+
+test('chat requests let the server decide research for every web-capable assistant', async () => {
+  const server = await readFile(new URL('../server.js', import.meta.url), 'utf8');
+  assert.match(server, /typeof b\.webEnabled === 'boolean' \? b\.webEnabled/);
+  assert.match(server, /heuristicResearchDecision\(plainMsgs/);
+  assert.match(server, /modelResearchDecision\(completeClassifier, plainMsgs/);
+  assert.match(server, /const shouldResearch = finalResearchPlan\.decision === 'search'/);
+  assert.match(server, /if \(shouldResearch\) \{/);
+});
 
 test('a follow-up web search resolves a book reference from the user conversation', () => {
   const messages = [
@@ -22,6 +72,17 @@ test('standalone searches stay unchanged and assistant text is not used as topic
     { role: 'assistant', content: 'Fancy Bear Goes Phishing is a book.' },
     { role: 'user', content: 'Search the internet about the book.' }
   ]), 'Search the internet about the book.');
+});
+
+test('contextual follow-up searches resolve entities from the user conversation', () => {
+  const query = contextualResearchQuery([
+    { role: 'user', content: 'I am comparing Pixel 10 and iPhone 17 for battery life.' },
+    { role: 'assistant', content: 'The Pixel is better because of a fictional benchmark.' },
+    { role: 'user', content: 'Which one has better battery life right now?' }
+  ]);
+  assert.match(query, /Pixel 10 and iPhone 17/);
+  assert.match(query, /Which one has better battery life right now/);
+  assert.doesNotMatch(query, /fictional benchmark/);
 });
 
 test('quick search uses one bounded query and handles empty input', () => {

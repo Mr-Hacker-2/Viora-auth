@@ -1,5 +1,48 @@
 export const researchMode = value => value === 'deep' ? 'deep' : 'quick';
 
+const explicitResearch = /\b(?:search (?:the )?(?:internet|web)|search for|look up|browse (?:the )?(?:internet|web)|on the (?:internet|web)|find (?:websites|sources|articles|studies|papers)|fact[- ]?check|cross[- ]?check|research (?:this|the|a|an|about)|with citations|cite (?:your )?sources)\b/i;
+const freshInformation = /\b(?:latest|most recent|current(?:ly)?|right now|today|tonight|this week|this month|this year|recent(?:ly)?|news|price|pricing|cost|in stock|availability|weather|forecast|exchange rate|tax rate|release notes|version|schedule|score|standings|election|outage|opening hours|travel restriction|security advisory|202[4-9])\b/i;
+const pageReference = /\b(?:this|that|attached|above|the)\s+(?:report|document|file|page|article|source|website)\b|\b(?:in|from|on)\s+(?:it|this|that)\b/i;
+const simpleRequest = /^(?:hi|hello|hey|good (?:morning|afternoon|evening)|thanks|thank you|okay|ok|got it|bye)\b/i;
+const knownTask = /^(?:solve|calculate|compute|simplify|factor|differentiate|integrate|debug|fix|rewrite|rephrase|proofread|shorten|summarize this text|draft|write (?:me )?(?:a|an|some)\s+(?:story|poem|email|letter|script|function|program|plan)|brainstorm|make up|imagine|tell me a story|help me code)\b/i;
+const arithmeticQuestion = /^(?:what(?:'s| is)|how much is)\s*[-+]?\d[\d,.]*\s*(?:[+\-*/^×÷]|percent of|% of)\s*[-+]?\d/i;
+const factualQuestion = /^(?:who|what|when|where|why|how|which|is|are|was|were|did|does|do|can|could|would|should|will|tell me|give me)\b/i;
+
+export function heuristicResearchDecision(messages, {
+  assistant = 'flash',
+  enabled = true,
+  task = 'chat',
+  hasPage = false,
+  clientHint = false
+} = {}) {
+  const latest = [...(Array.isArray(messages) ? messages : [])].reverse()
+    .find(message => message?.role === 'user' && String(message.content || '').trim());
+  const query = String(latest?.content || '').replace(/\s+/g, ' ').trim().slice(0, 1000);
+  if (!enabled) return { decision: 'disabled', query: '' };
+  if (assistant === 'humanize') return { decision: 'direct', query: '' };
+  if (clientHint || explicitResearch.test(query) || task === 'research') return { decision: 'search', query: '' };
+  if (hasPage && pageReference.test(query)) return { decision: 'model', query: '' };
+  if (freshInformation.test(query)) return { decision: 'search', query: '' };
+  if (!query || simpleRequest.test(query) || knownTask.test(query) || arithmeticQuestion.test(query)) return { decision: 'direct', query: '' };
+  if (/\b(?:book|novel|chapter|contents|author|writer|synopsis|plot)\b/i.test(query)) return { decision: 'model', query: '' };
+  if (['fix', 'improve', 'rewrite', 'shorten', 'expand', 'simplify', 'tone', 'restructure', 'edit', 'continue', 'build'].includes(task)) {
+    return { decision: 'direct', query: '' };
+  }
+  if (task === 'explain' && /^(?:explain|what is|what are|how does|why does)\b/i.test(query)) {
+    return { decision: 'direct', query: '' };
+  }
+  return factualQuestion.test(query) ? { decision: 'model', query: '' } : { decision: 'direct', query: '' };
+}
+
+export function shouldReviewResearchAnswer({ hasSearchEvidence = false, requestedReview = false, hasMultimodalInput = false } = {}) {
+  return hasSearchEvidence === true || (!hasMultimodalInput && requestedReview === true);
+}
+
+export function researchReviewRequiresRetry(result) {
+  const score = Number(result?.score);
+  return result?.retry === true || (Number.isFinite(score) && score <= 5);
+}
+
 const normalizeTitle = value => String(value || '').normalize('NFKC').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 const cleanBookTitle = value => String(value || '').replace(/\s+/g, ' ').replace(/^[\s"'“”‘’]+|[\s"'“”‘’.,!?;:]+$/g, '').trim().slice(0, 160);
 
@@ -33,16 +76,22 @@ export function contextualResearchQuery(messages, summary = '') {
   if (latestIndex < 0) return '';
 
   const query = String(history[latestIndex].content).replace(/\s+/g, ' ').trim().slice(0, 500);
-  if (!/\b(?:book|novel|chapter|contents?)\b/i.test(query)) return query;
-
   const priorUserText = [
-    ...history.slice(0, latestIndex).filter(message => message?.role === 'user').map(message => String(message.content || '')),
-    ...String(summary || '').split(/\n(?=(?:User|Viora):\s)/).filter(row => /^User:\s/i.test(row)).map(row => row.replace(/^User:\s*/i, ''))
+    ...String(summary || '').split(/\n(?=(?:User|Viora):\s)/).filter(row => /^User:\s/i.test(row)).map(row => row.replace(/^User:\s*/i, '')),
+    ...history.slice(0, latestIndex).filter(message => message?.role === 'user').map(message => String(message.content || ''))
   ];
-  const title = priorUserText.reverse().map(extractBookTitle).find(Boolean);
-  if (!title) return query;
-
-  return `"${title}" ${query}`.slice(0, 500);
+  if (/\b(?:book|novel|chapter|contents?)\b/i.test(query)) {
+    const title = [...priorUserText].reverse().map(extractBookTitle).find(Boolean);
+    if (title) return `"${title}" ${query}`.slice(0, 500);
+  }
+  if (/\b(?:it|its|that|this|they|them|those|these|there|one|ones|same|still|again|what about|and (?:what|which|how))\b/i.test(query)) {
+    const context = [...priorUserText].reverse().find(text => {
+      const clean = String(text || '').replace(/\s+/g, ' ').trim();
+      return clean.length >= 24 && !/^(?:yes|no|okay|ok|thanks|thank you)\b/i.test(clean);
+    });
+    if (context) return `${String(context).replace(/\s+/g, ' ').trim().slice(-300)} Follow-up: ${query}`.slice(0, 500);
+  }
+  return query;
 }
 
 export function sourceRecencyScore(publishedAt, now = Date.now()) {

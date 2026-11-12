@@ -123,3 +123,28 @@ test('deep research preserves sources matched to later focused queries', async (
   assert.ok(result.sources.some(source => source.url === 'https://react.example/performance'));
   assert.ok(result.sources.some(source => source.url === 'https://vue.example/performance'));
 });
+
+test('quick search refines once when the first query returns no relevant results', async () => {
+  const requestedQueries = [];
+  const fetchImpl = async rawUrl => {
+    const url = new URL(String(rawUrl));
+    if (url.hostname === 'www.bing.com') {
+      const query = url.searchParams.get('q') || '';
+      requestedQueries.push(query);
+      return query === 'battery charging regulation'
+        ? response(rss([]))
+        : response(rss([
+          { title: 'Battery charging regulation guidance', url: 'https://energy.example/charging', description: 'Official battery charging regulation and safety guidance.' }
+        ]));
+    }
+    if (url.hostname === 'html.duckduckgo.com') return response('<html><body>Verify you are human</body></html>');
+    throw new Error('Unexpected search provider');
+  };
+  const result = await searchWeb('battery charging regulation', 'quick', null, fetchImpl);
+
+  assert.equal(requestedQueries.length, 2);
+  assert.equal(requestedQueries[0], 'battery charging regulation');
+  assert.match(requestedQueries[1], /primary sources evidence/);
+  assert.equal(result.queries.length, 2);
+  assert.equal(result.sources.length, 1);
+});

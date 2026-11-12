@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { UNIVERSAL, PROFILES, systemFor, heuristicIntent, modelIntent, taskGuide, EDIT_RULES, EDIT_TASKS, editSource, checkEdit, checkCode, claimsExecution, qualityNotes } from '../intelligence.js';
+import { UNIVERSAL, PROFILES, systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, EDIT_RULES, EDIT_TASKS, editSource, checkEdit, checkCode, claimsExecution, qualityNotes } from '../intelligence.js';
 
 /* ---- per-assistant instructions: each model must carry its own specialised, honest strategy ---- */
 const REQUIRED = {
   flash: [/misspelled|informal/i, /follow explicit instructions exactly/i, /never imply that you browsed/i],
-  search: [/source records only/i, /disagree/i, /outdated|undated/i, /never invent a source/i, /not independent verification/i, /what the sources state.*infer.*unknown/i],
+  search: [/source records only/i, /disagree/i, /outdated|undated/i, /never invent a source/i, /not independent verification/i, /what the sources state.*infer.*unknown/i, /discovered and publicly reported/i, /confidence qualitatively/i, /defensive implications/i],
   math: [/verify the result/i, /whole supplied program|read the whole/i, /security/i, /edge cases/i, /cannot execute code/i, /syntax errors/i],
   humanize: [/concise/i, /conversational/i, /academic/i, /casual/i, /professional/i, /do not invent personal experiences/i, /Return only plain text/i]
 };
@@ -26,8 +26,8 @@ test('chat assistants get the universal standard; the Humanizer rewriting tool d
   assert.ok(!systemFor('humanize').includes('RESPONSE STANDARD'));
   assert.equal(systemFor('nope'), '');
 });
-test('universal standard covers context, corrections, honesty about actions and untrusted data', () => {
-  for (const re of [/that one|previous version/i, /correction/i, /never say something was done/i, /untrusted data/i, /clarifying question only when/i, /uncertainty/i]) assert.match(UNIVERSAL, re);
+test('universal standard covers context, corrections, honest research and untrusted data', () => {
+  for (const re of [/that one|previous version/i, /correction/i, /never say something was done/i, /untrusted data/i, /clarifying question only when/i, /uncertainty/i, /supplied search sources/i, /never say browsing is unavailable/i]) assert.match(UNIVERSAL, re);
 });
 test('prompts stay a sane size', () => { for (const a of Object.keys(PROFILES)) assert.ok(systemFor(a).length < 4500, a); });
 
@@ -67,6 +67,21 @@ test('modelIntent returns a validated reading, or null on any failure', async ()
   assert.equal(await modelIntent(async () => '{"task":"hack the planet"}', []), null);
   assert.equal(await modelIntent(async () => 'no json', []), null);
   assert.equal(await modelIntent(async () => { throw new Error('timeout'); }, []), null);
+});
+test('modelResearchDecision uses the conversation and attachment, and accepts only boolean decisions', async () => {
+  const messages = [{ role: 'user', content: 'Who wrote Fancy Bear Goes Phishing?' }];
+  const direct = await modelResearchDecision(async prompts => {
+    const data = JSON.parse(prompts[1].content);
+    assert.match(data.conversation[0].content, /Fancy Bear/);
+    assert.match(data.summary, /met the author/);
+    assert.match(data.attachment.text, /book notes/);
+    return '{"needsWeb":false,"query":""}';
+  }, messages, { summary: 'User: met the author', attachment: { title: 'Notes', text: 'book notes' } });
+  assert.deepEqual(direct, { decision: 'direct', query: '' });
+  assert.deepEqual(await modelResearchDecision(async () => '{"needsWeb":true,"query":"Fancy Bear Goes Phishing author"}', messages), {
+    decision: 'search', query: 'Fancy Bear Goes Phishing author'
+  });
+  assert.equal(await modelResearchDecision(async () => '{"needsWeb":"yes"}', messages), null);
 });
 
 /* ---- editing guidance ---- */
