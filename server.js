@@ -696,18 +696,81 @@ async function handleAdmin(req, res, u) {
     return json(res, 200, { ok: true, role: 'admin', email: actor });
   }
   if (req.method === 'GET' && path === '/api/admin/models') {
+    const flash = await readFlashConfig(true);
     const models = Object.entries(ASSIST).map(([id, config]) => ({
       id, name: id === 'flash' ? 'Viora Flash' : id === 'search' ? 'Pro Search' : id === 'math' ? 'Math & Code' : 'Humanizer',
-      provider: 'NVIDIA NIM',
-      configured: !!(process.env['NVIDIA_' + config.env + '_KEY'] || process.env.NVIDIA_API_KEY),
-      modelNames: config.chain.slice(),
-      connection: 'not_tested'
+      provider: 'NVIDIA NIM', configured: !!(process.env['NVIDIA_' + config.env + '_KEY'] || process.env.NVIDIA_API_KEY),
+      modelNames: id === 'flash' ? flash.models.map(x => x.id) : config.chain.slice(),
+      connection: id === 'flash' ? (modelRuntime.get(flash.primaryModel)?.lastStatus || (process.env.NVIDIA_API_KEY || process.env.NVIDIA_FLASH_KEY ? 'not_tested' : 'not_configured')) : 'not_tested'
     }));
     models.unshift({ id: 'auto', name: 'Viora Auto', provider: 'Viora router', configured: null, modelNames: [], connection: 'router' });
-    const multimodalKey = null;
-    models.push({ id: 'image', name: 'Image understanding', provider: 'NVIDIA NIM', configured: multimodalKey, modelNames: ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', 'meta/llama-3.2-90b-vision-instruct'], connection: 'not_tested' });
-    models.push({ id: 'video', name: 'Video understanding', provider: 'NVIDIA NIM', configured: multimodalKey, modelNames: ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning'], connection: 'not_tested' });
-    return json(res, 200, { provider: 'NVIDIA NIM', models, controls: 'unavailable' });
+    models.push({ id: 'image', name: 'Image understanding', provider: 'NVIDIA NIM', configured: null, modelNames: ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', 'meta/llama-3.2-90b-vision-instruct'], connection: 'not_tested' });
+    models.push({ id: 'video', name: 'Video understanding', provider: 'NVIDIA NIM', configured: null, modelNames: ['nvidia/nemotron-3-nano-omni-30b-a3b-reasoning'], connection: 'not_tested' });
+    return json(res, 200, {
+      provider: 'NVIDIA NIM', providerBaseUrl: NV, models, controls: b2Ready() ? 'available' : 'unavailable',
+      flash: { ...flash, persisted: b2Ready(), metrics: Object.fromEntries(flash.models.map(model => [model.id, modelRuntime.get(model.id) || { successCount: 0, failureCount: 0, lastLatencyMs: null, lastStatus: 'not_tested', lastAt: null }])) }
+    });
+  }
+  if (req.method === 'POST' && path === '/api/admin/models') {
+    if (!b2Ready()) return json(res, 503, { error: 'Persistent model settings require private storage to be configured.' });
+    let body; try { body = await readBody(req, 12000); } catch { return json(res, 400, { error: 'Invalid model settings.' }); }
+    try {
+      const config = await saveFlashConfig(body);
+      await writeAdminAudit(actor, 'flash_models_updated', config.primaryModel, 'success', { count: config.models.length });
+      return json(res, 200, { ok: true, ...config, persisted: true });
+    } catch (error) { return json(res, 400, { error: error?.message === 'storage_off' ? 'Persistent model settings require private storage.' : error?.message || 'Invalid model settings.' }); }
+  }
+  if (req.method === 'POST' && path === '/api/admin/models/test') {
+    let body; try { body = await readBody(req, 5000); } catch { return json(res, 400, { error: 'Invalid model test request.' }); }
+    const config = await readFlashConfig(true), model = config.models.find(item => item.id === body.modelId);
+    if (!model) return json(res, 404, { error: 'That model is not in the Flash priority list.' });
+    const key = process.env.NVIDIA_FLASH_KEY || process.env.NVIDIA_API_KEY;
+    if (!key) return json(res, 503, { error: 'No NVIDIA API key is configured on the server.' });
+    const started = Date.now(), controller = new AbortController(), timer = setTimeout(() => controller.abort(), model.timeoutMs);
+    try {
+      const response = await fetch(NV + '/chat/completions', { method: 'POST', headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: model.id, messages: [{ role: 'user', content: 'Reply with the single word OK.' }], max_tokens: 8, temperature: 0, stream: false }), signal: controller.signal });
+      const latencyMs = Date.now() - started, data = response.ok ? await response.json().catch(() => null) : null;
+      const usable = !!String(data?.choices?.[0]?.message?.content || '').trim(), ok = response.ok && usable;
+      recordModelMetric(model.id, ok, latencyMs);
+      if (!ok) { modelFail(model.id, response.status); await writeAIReport({ type: !response.ok ? response.status === 429 ? 'rate_limit' : 'provider_error' : 'invalid_response', model: model.id, status: response.status, description: 'Administrator model connection test failed or returned no usable text.', recoveryStatus: 'admin_test_failed' }); }
+      return json(res, 200, { model: model.id, provider: model.provider, connection: ok ? 'healthy' : 'unreachable', latencyMs, status: response.status,
+        successCount: modelRuntime.get(model.id).successCount, failureCount: modelRuntime.get(model.id).failureCount, error: ok ? null : 'The model did not return a usable response.' });
+    } catch {
+      const latencyMs = Date.now() - started; recordModelMetric(model.id, false, latencyMs); modelFail(model.id, 0);
+      const type = controller.signal.aborted ? 'timeout' : 'connection_failure';
+      await writeAIReport({ type, model: model.id, status: null, description: type === 'timeout' ? 'Administrator model connection test timed out.' : 'Administrator model connection test failed to connect.', recoveryStatus: 'admin_test_failed' });
+      return json(res, 200, { model: model.id, provider: model.provider, connection: 'unreachable', latencyMs, error: type === 'timeout' ? 'The model test timed out.' : 'The model could not be reached.' });
+    } finally { clearTimeout(timer); }
+  }
+  if (req.method === 'GET' && path === '/api/admin/ai-errors') {
+    if (!b2Ready()) return json(res, 503, { error: 'Persistent AI reports require private storage to be configured.' });
+    try {
+      const keys = []; let token = '';
+      while (keys.length < 500) {
+        const page = await listKeys('ai/errors/', token, Math.min(250, 500 - keys.length));
+        keys.push(...page.keys);
+        if (!page.truncated || !page.nextToken) break;
+        token = page.nextToken;
+      }
+      const rows = [];
+      for (let i = 0; i < keys.length; i += 25) rows.push(...(await Promise.all(keys.slice(i, i + 25).map(async key => { try { return await getJson(key); } catch { return null; } }))).filter(Boolean));
+      const state = String(u.searchParams.get('state') || '').slice(0, 20), type = String(u.searchParams.get('type') || '').slice(0, 60);
+      return json(res, 200, { reports: rows.filter(x => (!state || x.state === state) && (!type || x.type === type)).sort((a,b) => String(b.at).localeCompare(String(a.at))).slice(0,100) });
+    } catch { return json(res, 503, { error: 'AI reports could not be read.' }); }
+  }
+  if (req.method === 'POST' && path === '/api/admin/ai-errors/action') {
+    let body; try { body = await readBody(req, 5000); } catch { return json(res, 400, { error: 'Invalid AI report action.' }); }
+    const id = String(body.id || '');
+    if (!/^\\d+_[0-9a-f-]{36}$/i.test(id) || !['acknowledged','resolved','open'].includes(body.state)) return json(res, 400, { error: 'A valid report ID and state are required.' });
+    try {
+      const key = 'ai/errors/' + id + '.json', report = await getJson(key);
+      if (!report) return json(res, 404, { error: 'AI report not found.' });
+      report.state = body.state; report.updatedAt = new Date().toISOString(); report.updatedBy = actor;
+      await putJson(key, report);
+      await writeAdminAudit(actor, 'ai_report_' + body.state, id, 'success');
+      return json(res, 200, { ok: true, report });
+    } catch { return json(res, 503, { error: 'The AI report could not be updated.' }); }
   }
   if (req.method === 'GET' && path === '/api/admin/overview') {
     try {
