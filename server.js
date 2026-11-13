@@ -1600,9 +1600,12 @@ http.createServer(async (req, res) => {
       const state = sign({ ext, site, mode, email, termsAccepted, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
       const params = new URLSearchParams({
         client_id: GOOGLE_CLIENT_ID, redirect_uri: REDIRECT, response_type: 'code',
-        scope: 'openid email profile', state, prompt: 'select_account'
+        scope: 'openid email profile', state
       });
+      // A submitted email is a login hint. Do not force Google's account chooser in that case,
+      // because select_account can override the address the user entered on Viora.
       if (email) params.set('login_hint', email);
+      else params.set('prompt', 'select_account');
       res.writeHead(302, {
         Location: 'https://accounts.google.com/o/oauth2/v2/auth?' + params
       });
@@ -1627,6 +1630,7 @@ http.createServer(async (req, res) => {
         headers: { Authorization: 'Bearer ' + tok.access_token }
       })).json();
       if (!info.email || !info.email_verified) return back(res, st, { error: 'unverified_email' });
+      if (st.email && normEmail(info.email) !== normEmail(st.email)) return back(res, st, { error: 'email_mismatch' });
       const user = { email: info.email, name: info.name || '', picture: info.picture || '' };
       const account = await recordSignIn(user, st.mode, { requireSignupConsent: !!st.site, termsAccepted: !!st.termsAccepted });
       if (account?.authError) return back(res, account.authError === 'account_not_found' ? { ...st, email: normEmail(user.email) } : st, { error: account.authError });
