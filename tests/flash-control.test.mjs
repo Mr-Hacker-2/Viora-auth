@@ -88,7 +88,7 @@ test('conversation trimming keeps the original latest user message and recent co
   ];
   const trimmed = trimConversationMessages(messages,{maxTotalChars:120,maxPriorMessageChars:40,maxLatestUserChars:60});
   assert.equal(trimmed.at(-1).content,'my complete original request');
-  assert.deepEqual(trimmed.map(x=>x.role),['assistant','user']);
+  assert.deepEqual(trimmed.map(x=>x.role),['user','assistant','user']);
   assert.ok(trimmed.reduce((n,x)=>n+x.content.length,0)<=120);
 });
 test('conversation trimming preserves role order and caps very long latest messages', () => {
