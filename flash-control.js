@@ -36,6 +36,32 @@ export function normalizeFlashConfig(value) {
   return { models, primaryModel: models.find(model => model.enabled).id };
 }
 
+export function trimConversationMessages(input, { maxMessages = 24, maxTotalChars = 64000, maxPriorMessageChars = 4000, maxLatestUserChars = 20000 } = {}) {
+  const source = (Array.isArray(input) ? input : []).slice(-maxMessages).map(message => ({
+    role: message?.role === 'assistant' ? 'assistant' : 'user',
+    content: String(message?.content || '')
+  }));
+  let latestUser = -1;
+  for (let i = source.length - 1; i >= 0; i--) if (source[i].role === 'user') { latestUser = i; break; }
+  const kept = new Array(source.length).fill(null);
+  let used = 0;
+  if (latestUser >= 0) {
+    const content = source[latestUser].content.slice(0, maxLatestUserChars);
+    kept[latestUser] = { role: 'user', content };
+    used = content.length;
+  }
+  let remaining = Math.max(0, maxTotalChars - used);
+  for (let i = source.length - 1; i >= 0 && remaining > 0; i--) {
+    if (i === latestUser) continue;
+    const content = source[i].content.slice(-Math.min(maxPriorMessageChars, remaining));
+    if (!content && source[i].content) continue;
+    kept[i] = { role: source[i].role, content };
+    used += content.length;
+    remaining -= content.length;
+  }
+  return kept.filter(Boolean);
+}
+
 export function fallbackModels(config, health = new Map(), now = Date.now()) {
   const enabled = normalizeFlashConfig(config).models.filter(model => model.enabled);
   const healthy = enabled.filter(model => (health.get(model.id)?.until || 0) <= now);
