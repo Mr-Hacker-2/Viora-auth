@@ -97,7 +97,7 @@ async function writeAIReport(data) {
   if (!b2Ready()) return false;
   const id = Date.now() + '_' + crypto.randomUUID();
   const report = { id, at: new Date().toISOString(), type: String(data.type || 'provider_error').slice(0, 60),
-    model: String(data.model || '').slice(0, 140), provider: 'NVIDIA NIM', status: Number.isInteger(data.status) ? data.status : null,
+    model: String(data.model || '').slice(0, 140), provider: 'NVIDIA NIM', status: Number.isInteger(data.status) ? data.status : null, latencyMs: Number.isFinite(data.latencyMs) ? Math.max(0, Math.round(data.latencyMs)) : null,
     description: sanitizeProviderError(data.description, [process.env.NVIDIA_API_KEY, process.env.NVIDIA_FLASH_KEY]),
     recoveryStatus: String(data.recoveryStatus || 'failed').slice(0, 40), fallbackModel: String(data.fallbackModel || '').slice(0, 140),
     requestId: String(data.requestId || '').slice(0, 80), state: 'open' };
@@ -1248,7 +1248,7 @@ async function chat(req, res, user) {
     : visionRequested
       ? [{ id: omni, enabled: true, timeoutMs: 45000, provider: 'NVIDIA NIM' }, { id: 'meta/llama-3.2-90b-vision-instruct', enabled: true, timeoutMs: 45000, provider: 'NVIDIA NIM' }]
       : flashConfig
-        ? flashConfig.models.filter(model => model.enabled)
+        ? fallbackModels(flashConfig, modelHealth)
         : [...new Set(thinkPlan.chain)].map(id => ({ id, enabled: true, timeoutMs: thinkBoost ? THINK_LIMITS.providerHeaderMs : 12000, provider: 'NVIDIA NIM' }));
   const modelChain = modelEntries.map(model => model.id);
   const requestId = crypto.randomUUID();
