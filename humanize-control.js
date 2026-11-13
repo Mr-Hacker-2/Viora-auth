@@ -51,5 +51,7 @@ export function validateHumanizeOutput(draft, output, { complete = true, malform
   const before = protectedFacts(source), after = protectedFacts(result);
   const missing = [...before].filter(fact => !after.has(fact));
   if (missing.length) return { ok: false, reason: 'facts_missing', sourceWords, outputWords, minimumWords, missing };
-  return { ok: true, reason: '', sourceWords, outputWords, minimumWords, missing: [] };
+  const addedNumbers = [...after].filter(fact => fact.startsWith('number:') && !before.has(fact));
+  if (addedNumbers.length) return { ok: false, reason: 'facts_added', sourceWords, outputWords, minimumWords, missing: [], added: addedNumbers };
+  return { ok: true, reason: '', sourceWords, outputWords, minimumWords, missing: [], added: [] };
 }
