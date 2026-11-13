@@ -1240,67 +1240,71 @@ async function chat(req, res, user) {
   if (!videoRequested && !audioRequested) { const guide = taskGuide(intent); if (guide) sys += '\n\n' + guide; }
   let r = null;
   const omni = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning';
-  const modelChain = videoRequested || audioRequested
-    ? [omni]
+  const omni = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning';
+  const useFlashPriority = b.assistant === 'flash' && !videoRequested && !audioRequested && !visionRequested;
+  const flashConfig = useFlashPriority ? await readFlashConfig() : null;
+  const modelEntries = videoRequested || audioRequested
+    ? [{ id: omni, enabled: true, timeoutMs: 45000, provider: 'NVIDIA NIM' }]
     : visionRequested
-      ? [omni, 'meta/llama-3.2-90b-vision-instruct']
-      : [...new Set(thinkPlan.chain)];
-  let lastProviderStatus = 0;
-  let selectedModel = '';
-  // Keep fallback attempts bounded: a slow first model must not make every
-  // subsequent model wait another full 30 seconds.
-  for (const model of modelChain) {
-    if (clientGone) break;
+      ? [{ id: omni, enabled: true, timeoutMs: 45000, provider: 'NVIDIA NIM' }, { id: 'meta/llama-3.2-90b-vision-instruct', enabled: true, timeoutMs: 45000, provider: 'NVIDIA NIM' }]
+      : flashConfig
+        ? flashConfig.models.filter(model => model.enabled)
+        : [...new Set(thinkPlan.chain)].map(id => ({ id, enabled: true, timeoutMs: thinkBoost ? THINK_LIMITS.providerHeaderMs : 12000, provider: 'NVIDIA NIM' }));
+  const modelChain = modelEntries.map(model => model.id);
+  const requestId = crypto.randomUUID();
+  const modelDeadline = Date.now() + 60000;
+  let lastProviderStatus = 0, selectedModel = '', selectedHeaderMs = 0;
+  const requestProviderModel = async modelConfig => {
+    const model = modelConfig.id, startedAt = Date.now(), remaining = modelDeadline - startedAt;
+    if (remaining <= 0) return { ok: false, error: Object.assign(new Error('Provider request timed out.'), { name: 'TimeoutError' }) };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(modelConfig.timeoutMs || 12000, remaining));
     try {
-      // Bound time to provider headers, then let the frontend's stream-stall
-      // timeout govern generation. AbortSignal.timeout() on fetch also aborts
-      // the response body, which can cut off an otherwise healthy long answer.
-      const providerCtl = new AbortController();
-      const providerTimer = setTimeout(
-        () => providerCtl.abort(),
-        videoRequested || audioRequested || visionRequested ? 45000 : thinkBoost ? THINK_LIMITS.providerHeaderMs : 12000
-      );
-      let attempt;
-      try {
-        attempt = await fetch(`${NV}/chat/completions`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            messages: [{ role: 'system', content: sys }, ...msgs],
-            temperature: Number.isFinite(b.temperature) ? Math.max(0, Math.min(2, b.temperature)) : thinkTemperature(a.t, thinkPlan.applied),
-            max_tokens: Number.isInteger(b.max_tokens) ? Math.max(16, Math.min(thinkBoost ? THINK_LIMITS.maxTokens : 3072, b.max_tokens)) : (videoRequested || audioRequested ? 3072 : thinkBoost ? THINK_LIMITS.maxTokens : b.assistant === 'flash' ? 2048 : 3072),
-            ...(videoRequested || audioRequested || visionRequested ? { chat_template_kwargs: { enable_thinking: false } } : {}),
-            ...(videoRequested ? { mm_processor_kwargs: { use_audio_in_video: true } } : {}),
-            stream: true
-          }),
-          signal: AbortSignal.any([providerCtl.signal, requestCtl.signal])
-        });
-      } finally {
-        clearTimeout(providerTimer);
-      }
-      if (attempt.ok && attempt.body) {
-        r = attempt;
-        selectedModel = model;
-        console.info(`AI provider selected: ${model}`);
-        break;
-      }
-      lastProviderStatus = attempt.status;
-      const detail = (await attempt.text().catch(() => '')).slice(0, 500).replace(/[\r\n]+/g, ' ');
-      console.warn(`AI model ${model} returned HTTP ${attempt.status}${detail ? ': ' + detail : ''}`);
-    } catch (e) {
-      console.warn(`AI model ${model} failed: ${e?.name || 'Error'}${e?.message ? ' — ' + e.message : ''}`);
+      const response = await fetch(`${NV}/chat/completions`, {
+        method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model, messages: [{ role: 'system', content: sys }, ...msgs],
+          temperature: Number.isFinite(b.temperature) ? Math.max(0, Math.min(2, b.temperature)) : thinkTemperature(a.t, thinkPlan.applied),
+          max_tokens: Number.isInteger(b.max_tokens) ? Math.max(16, Math.min(thinkBoost ? THINK_LIMITS.maxTokens : 3072, b.max_tokens)) : (videoRequested || audioRequested ? 3072 : thinkBoost ? THINK_LIMITS.maxTokens : b.assistant === 'flash' ? 2048 : 3072),
+          ...(videoRequested || audioRequested || visionRequested ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+          ...(videoRequested ? { mm_processor_kwargs: { use_audio_in_video: true } } : {}), stream: true
+        }),
+        signal: AbortSignal.any([controller.signal, requestCtl.signal])
+      });
+      const latencyMs = Date.now() - startedAt;
+      if (!response.ok) { lastProviderStatus = response.status; await response.body?.cancel().catch(() => {}); return { ok: false, status: response.status, error: new Error(response.status === 429 ? 'Provider rate limited the request.' : 'Provider returned HTTP ' + response.status + '.') }; }
+      const type = String(response.headers.get('content-type') || '').toLowerCase();
+      if (!response.body || (type && !type.includes('text/event-stream'))) { await response.body?.cancel().catch(() => {}); return { ok: false, status: response.status, usable: false, error: new Error('Provider returned an invalid stream response.') }; }
+      return { ok: true, value: response, latencyMs };
+    } catch (error) {
+      return { ok: false, error: controller.signal.aborted && !requestCtl.signal.aborted ? Object.assign(new Error('Provider request timed out.'), { name: 'TimeoutError' }) : requestCtl.signal.aborted ? new Error('Request cancelled.') : new Error('Provider connection failed.') };
+    } finally { clearTimeout(timer); }
+  };
+  const selection = await runModelFallback(modelEntries, requestProviderModel, {
+    onFailure: (failure, model, index) => {
+      lastProviderStatus = failure.status || lastProviderStatus;
+      modelFail(model.id, failure.status);
+      recordModelMetric(model.id, false, null);
+      queueAIReport({ type: failure.type, model: model.id, status: failure.status, description: failure.error,
+        recoveryStatus: index + 1 < modelEntries.length ? 'retrying' : 'all_models_failed',
+        fallbackModel: modelEntries[index + 1]?.id || '', requestId });
     }
+  });
+  if (selection.ok) {
+    r = selection.result.value; selectedModel = selection.model.id; selectedHeaderMs = selection.result.latencyMs;
+    if (selection.failures.length) queueAIReport({ type: 'model_switch', model: selection.failures.at(-1).model, status: selection.failures.at(-1).status,
+      description: 'Flash recovered by switching to the next configured model.', recoveryStatus: 'recovered', fallbackModel: selectedModel, requestId });
   }
   if (clientGone) return;
   if (!r) {
+    await queueAIReport({ type: 'all_models_failed', model: modelEntries.at(-1)?.id || '', status: lastProviderStatus || null,
+      description: 'Every configured provider model failed before streaming started.', recoveryStatus: 'failed', requestId });
+    await flushAIReports();
     const message = lastProviderStatus === 401 || lastProviderStatus === 403
       ? 'The AI provider rejected the server key or model access. Please contact the site owner.'
       : 'All available AI models failed or timed out. Please retry in a moment.';
-    return json(res, 502, {
-      error: message,
-      ...(shouldResearch ? { viora_sources: publicSources, viora_research: publicResearch, viora_timings: publicTimings } : {})
-    });
+    return json(res, 502, { error: message, requestId,
+      ...(shouldResearch ? { viora_sources: publicSources, viora_research: publicResearch, viora_timings: publicTimings } : {}) });
   }
   reportProgress('writing', shouldResearch ? 'Analyzing sources and writing the response' : 'Writing the response');
   res.writeHead(200, {
