@@ -34,6 +34,10 @@ function protectedFacts(text) {
   let bare = source.replace(/\bhttps?:\/\/[^\s)\]>"']+|\bwww\.[^\s)\]>"']+/gi, ' ').replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, ' ');
   for (const value of bare.match(/(?<![\w.])[$€£]?\d(?:[\d,]*\d)?(?:\.\d+)?%?/g) || []) facts.add('number:' + normalizeNumber(value));
   for (const value of bare.match(/\b(?:[A-Z]{2,}[A-Z0-9]*|[a-z]+[A-Z][A-Za-z0-9]*)\b/g) || []) facts.add('identifier:' + value);
+  const commonSentenceStarts = new Set(['A', 'An', 'As', 'At', 'After', 'Before', 'But', 'By', 'For', 'From', 'He', 'Her', 'Here', 'I', 'In', 'It', 'On', 'She', 'So', 'That', 'The', 'Their', 'There', 'They', 'This', 'Those', 'We', 'When', 'While']);
+  for (const phrase of bare.match(/\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*/g) || []) {
+    if (!commonSentenceStarts.has(phrase.split(/\s+/)[0])) facts.add('name:' + phrase.toLowerCase());
+  }
   return facts;
 }
 
