@@ -1,8 +1,8 @@
 /* Pure Flash model controls. Safe to unit test without credentials, network, or server startup. */
 export const DEFAULT_FLASH_MODELS = Object.freeze([
-  Object.freeze({ id: 'nvidia/nemotron-3.5-lightning-30b-a3b', enabled: true, timeoutMs: 12000, provider: 'NVIDIA NIM' }),
-  Object.freeze({ id: 'deepseek-ai/deepseek-v4.1-flash', enabled: true, timeoutMs: 12000, provider: 'NVIDIA NIM' }),
-  Object.freeze({ id: 'z-ai/glm-5.3-flash', enabled: true, timeoutMs: 12000, provider: 'NVIDIA NIM' })
+  Object.freeze({ id: 'nvidia/nemotron-3.5-lightning-30b-a3b', enabled: true, timeoutMs: 30000, provider: 'NVIDIA NIM' }),
+  Object.freeze({ id: 'deepseek-ai/deepseek-v4.1-flash', enabled: true, timeoutMs: 30000, provider: 'NVIDIA NIM' }),
+  Object.freeze({ id: 'z-ai/glm-5.3-flash', enabled: true, timeoutMs: 30000, provider: 'NVIDIA NIM' })
 ]);
 export const MAX_FLASH_MODELS = 12;
 export const MIN_MODEL_TIMEOUT_MS = 1000;
