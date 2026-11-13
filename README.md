@@ -2,7 +2,9 @@
 Google sign-in, the AI proxy, and account storage in Backblaze B2.
 
 ## Environment variables (Render)
-Existing: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `TOKEN_SECRET`, `SITE_URL`, `BASE_URL`, `NVIDIA_API_KEY`.
+Existing: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `TOKEN_SECRET`, `SITE_URL`, `BASE_URL`, `NVIDIA_API_KEY`, `HUMANIZER_MODELS`.
+
+Set `HUMANIZER_MODELS` to a comma-separated list of NVIDIA NIM model IDs to choose the Humanizer fallback priority, for example `moonshotai/kimi-k3,deepseek-ai/deepseek-v4.1-flash,z-ai/glm-5.3`. Leave it unset to use that default order.
 
 Backblaze B2 (S3-compatible API, no extra packages):
 - `B2_KEY_ID`: application key ID (Backblaze → App Keys)

@@ -32,10 +32,11 @@ function startMockProvider() {
       return res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(verdict) } }] }));
     }
     const repair = system.includes('SELF-CORRECTION');
+    const humanizer = system.includes('You are Viora Writing Studio');
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     res.write(sse({ choices: [{ delta: { role: 'assistant', reasoning_content: 'PRIVATE-REASONING step one' } }] }));
-    res.write(sse({ choices: [{ delta: { content: repair ? 'Improved ' : 'Draft ' } }] }));
-    res.write(sse({ choices: [{ delta: { content: 'answer 391.', reasoning_content: 'PRIVATE-REASONING step two' } }] }));
+    res.write(sse({ choices: [{ delta: { content: humanizer ? 'hello ' : repair ? 'Improved ' : 'Draft ' } }] }));
+    res.write(sse({ choices: [{ delta: { content: humanizer ? 'there' : 'answer 391.', reasoning_content: 'PRIVATE-REASONING step two' } }] }));
     res.write(sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }));
     res.end('data: [DONE]\n\n');
   });

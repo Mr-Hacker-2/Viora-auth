@@ -6,6 +6,7 @@ import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { contextualResearchQuery, heuristicResearchDecision, researchLimits, researchMode, researchReviewRequiresRetry, shouldReviewResearchAnswer } from './research.js';
 import { buildResearchContext, searchWeb } from './web-search.js';
 import { createSseCompletionTracker } from './stream-completion.js';
+import { MAX_HUMANIZE_CHARS, MAX_HUMANIZE_WORDS, extractHumanizeDraft, humanizeWordCount, validateHumanizeOutput } from './humanize-control.js';
 import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
 import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, createReasoningStripper, stripReasoningFromEvent } from './think.js';
 import { accountFlowDecision } from './auth-flow.js';
@@ -51,6 +52,7 @@ const back = (res, st, params) => {
 
 /* ================= AI proxy: keys live here, never in the website ================= */
 const NV = (process.env.NVIDIA_API_URL || process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '');
+const HUMANIZER_MODEL_CHAIN = [...new Set(String(process.env.HUMANIZER_MODELS || '').split(',').map(id => id.trim()).filter(id => /^[a-z0-9][a-z0-9._/-]{2,127}$/i.test(id)))].slice(0, 12);
 const ASSIST = {
   flash:   { env: 'FLASH',   t: 0.6,  chain: ['nvidia/nemotron-3.5-lightning-30b-a3b', 'deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'],
     sys: systemFor('flash') },
@@ -58,7 +60,7 @@ const ASSIST = {
     sys: systemFor('search') },
   math:    { env: 'MATH',    t: 0.2,  chain: ['moonshotai/kimi-k3', 'nvidia/nemotron-3-ultra-550b-a55b', 'deepseek-ai/deepseek-v4.1-flash'],
     sys: systemFor('math') },
-  humanize:{ env: 'HUMANIZER',t: 0.85, chain: ['moonshotai/kimi-k3', 'deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3'],
+  humanize:{ env: 'HUMANIZER',t: 0.85, chain: HUMANIZER_MODEL_CHAIN.length ? HUMANIZER_MODEL_CHAIN : ['moonshotai/kimi-k3', 'deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3'],
     sys: systemFor('humanize') }
 };
 /* Per-model circuit breaker: three failures in a row take a model out of rotation for a minute (20 s after a rate limit),
@@ -917,6 +919,91 @@ async function reviewAnswer(key, model, question, draft, sources = [], attachmen
   }
 }
 
+async function humanizeChatStream({ res, key, sys, msgs, modelChain, modelConfig, thinkPlan, requestCtl, clientGone }) {
+  const write = async chunk => {
+    if (res.destroyed || clientGone) return false;
+    if (!res.write(chunk)) await new Promise(resolve => res.once('drain', resolve));
+    return !res.destroyed && !clientGone;
+  };
+  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no', ...cors() });
+  const draft = extractHumanizeDraft([...msgs].reverse().find(message => message.role === 'user')?.content);
+  for (let index = 0; index < modelChain.length; index++) {
+    if (res.destroyed || clientGone || requestCtl.signal.aborted) return;
+    const model = modelChain[index], startedAt = Date.now(), controller = new AbortController();
+    if (index) await write('data: ' + JSON.stringify({ viora_retry: { model, reason: 'humanizer_validation' } }) + '\n\n');
+    const timer = setTimeout(() => controller.abort(), 60000);
+    let response = null, failure = null, responseText = '', malformed = false, finishReason = '', providerError = '', status = null;
+    try {
+      response = await fetch(NV + '/chat/completions', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages: [{ role: 'system', content: sys }, ...msgs], temperature: modelConfig.t, max_tokens: 8192, stream: true }),
+        signal: AbortSignal.any([controller.signal, requestCtl.signal])
+      });
+      status = response.status;
+      if (!response.ok) failure = new Error('Provider returned HTTP ' + response.status + '.');
+      else if (!response.body || (response.headers.get('content-type') || '').toLowerCase().includes('application/json')) failure = new Error('Provider returned an invalid stream response.');
+      else {
+        const completion = createSseCompletionTracker(), decoder = new TextDecoder();
+        let pending = '';
+        const inspect = event => {
+          for (const line of event.split(/\r?\n/)) {
+            if (!line.startsWith('data:')) continue;
+            const data = line.slice(5).trim();
+            if (!data || data === '[DONE]') continue;
+            try {
+              const item = JSON.parse(data);
+              if (item.error) providerError = 'Provider stream returned an error.';
+              for (const choice of item.choices || []) {
+                if (choice?.finish_reason != null) finishReason = String(choice.finish_reason);
+                const text = choice?.delta?.content ?? choice?.message?.content;
+                if (typeof text === 'string') responseText += text;
+              }
+            } catch { if (data.startsWith('{')) malformed = true; }
+          }
+        };
+        try {
+          for await (const chunk of response.body) {
+            if (requestCtl.signal.aborted || res.destroyed || clientGone) break;
+            const piece = decoder.decode(chunk, { stream: true });
+            completion.push(piece); pending += piece;
+            let boundary;
+            while ((boundary = /\r?\n\r?\n/.exec(pending))) {
+              inspect(pending.slice(0, boundary.index));
+              pending = pending.slice(boundary.index + boundary[0].length);
+            }
+          }
+        } catch (error) { failure = requestCtl.signal.aborted ? error : new Error(controller.signal.aborted ? 'Provider generation timed out.' : 'Provider stream was interrupted.'); }
+        const tail = decoder.decode(); if (tail) { completion.push(tail); pending += tail; }
+        if (pending.trim()) inspect(pending);
+        const streamComplete = completion.finish() && !failure && !providerError;
+        const quality = validateHumanizeOutput(draft, responseText, { complete: streamComplete, malformed, finishReason });
+        if (requestCtl.signal.aborted || res.destroyed || clientGone) { clearTimeout(timer); return; }
+        if (quality.ok) {
+          clearTimeout(timer); modelOk(model);
+          const latency = Date.now() - startedAt;
+          await write('data: ' + JSON.stringify({ viora_meta: { model, modelHeaderMs: latency } }) + '\n\n');
+          if (thinkPlan?.requested) await write('data: ' + JSON.stringify({ viora_think: thinkReport(thinkPlan, { model, review: false }) }) + '\n\n');
+          await write('data: ' + JSON.stringify({ choices: [{ delta: { content: responseText } }] }) + '\n\n');
+          await write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+          await write('data: [DONE]\n\n');
+          if (!res.writableEnded) res.end();
+          return;
+        }
+        const reason = providerError || failure?.message || (quality.reason === 'too_short' ? 'Humanizer output was too short to preserve the draft.' : quality.reason === 'facts_missing' ? 'Humanizer output omitted protected details from the draft.' : quality.reason === 'empty' ? 'Humanizer returned an empty response.' : 'Humanizer stream ended incomplete or hit its output limit.');
+        failure = new Error(reason);
+      }
+    } catch (error) { failure = error; }
+    finally { clearTimeout(timer); try { await response?.body?.cancel(); } catch {} }
+    if (requestCtl.signal.aborted || res.destroyed || clientGone) return;
+    const type = status === 429 ? 'rate_limit' : status === 408 || status === 504 || controller.signal.aborted ? 'timeout' : status && status >= 500 ? 'provider_error' : 'invalid_response';
+    modelFail(model, status);
+    console.warn('Humanizer model attempt failed:', model, type, String(failure?.message || 'invalid response').slice(0, 180));
+  }
+  await write('data: ' + JSON.stringify({ viora_incomplete: { message: 'Every Humanizer model returned an incomplete or invalid rewrite. Your original draft is preserved; please retry or split it into shorter sections.' } }) + '\n\n');
+  await write('data: [DONE]\n\n');
+  if (!res.writableEnded) res.end();
+}
+
 async function chat(req, res, user) {
   const b = await readBody(req, 16e6), a = ASSIST[b.assistant];
   if (!a || !Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: 'Bad request.' });
@@ -963,7 +1050,12 @@ async function chat(req, res, user) {
   const thinkBoost = thinkPlan.applied && !videoRequested && !audioRequested && !visionRequested;
   if (thinkPlan.requested) runtimeMetrics.thinkRequests++;
   if (thinkPlan.upgraded) key = process.env[`NVIDIA_${ASSIST[thinkPlan.lane].env}_KEY`] || process.env.NVIDIA_API_KEY || key;
-  const msgs = b.messages.slice(-24).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, 20000) }));
+  const rawHumanizerMessage = [...b.messages].reverse().find(message => message?.role === 'user')?.content;
+  const humanizeDraft = b.assistant === 'humanize' ? extractHumanizeDraft(rawHumanizerMessage) : null;
+  if (b.assistant === 'humanize' && humanizeDraft == null) return json(res, 400, { error: 'The draft could not be read. Your original text is unchanged; please retry.' });
+  if (b.assistant === 'humanize' && (humanizeDraft.length > MAX_HUMANIZE_CHARS || humanizeWordCount(humanizeDraft) > MAX_HUMANIZE_WORDS)) return json(res, 413, { error: 'This draft exceeds the Humanizer limit of 5,000 words or 160,000 characters. Split it into shorter sections; the original text is unchanged.' });
+  const msgs = b.messages.slice(b.assistant === 'humanize' ? -1 : -24).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, b.assistant === 'humanize' ? MAX_HUMANIZE_CHARS : 20000) }));
+  if (b.assistant === 'humanize' && extractHumanizeDraft(msgs.at(-1)?.content) !== humanizeDraft) return json(res, 413, { error: 'The full draft did not fit in the request. Nothing was rewritten; use a shorter section.' });
   const plainMsgs = msgs.map((m) => ({ role: m.role, content: m.content }));
   const lastUserText = String([...plainMsgs].reverse().find((m) => m.role === 'user')?.content || '');
   if (researchRequestId && webEnabled) reportProgress('understand', 'Understanding your request and conversation');
@@ -1138,6 +1230,7 @@ async function chat(req, res, user) {
     : visionRequested
       ? [omni, 'meta/llama-3.2-90b-vision-instruct']
       : [...new Set(thinkPlan.chain)];
+  if (b.assistant === 'humanize') return await humanizeChatStream({ res, key, sys, msgs, modelChain, modelConfig: a, thinkPlan, requestCtl, clientGone });
   let lastProviderStatus = 0;
   let selectedModel = '';
   // Keep fallback attempts bounded: a slow first model must not make every
