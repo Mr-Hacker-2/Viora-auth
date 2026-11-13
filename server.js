@@ -918,7 +918,7 @@ async function reviewAnswer(key, model, question, draft, sources = [], attachmen
   }
 }
 
-async function humanizeChatStream({ res, key, sys, msgs, modelChain, modelConfig, requestCtl, clientGone }) {
+async function humanizeChatStream({ res, key, sys, msgs, modelChain, modelConfig, thinkPlan, requestCtl, clientGone }) {
   const write = async chunk => {
     if (res.destroyed || clientGone) return false;
     if (!res.write(chunk)) await new Promise(resolve => res.once('drain', resolve));
@@ -981,6 +981,7 @@ async function humanizeChatStream({ res, key, sys, msgs, modelChain, modelConfig
           clearTimeout(timer); modelOk(model);
           const latency = Date.now() - startedAt;
           await write('data: ' + JSON.stringify({ viora_meta: { model, modelHeaderMs: latency } }) + '\n\n');
+          if (thinkPlan?.requested) await write('data: ' + JSON.stringify({ viora_think: thinkReport(thinkPlan, { model, review: false }) }) + '\n\n');
           await write('data: ' + JSON.stringify({ choices: [{ delta: { content: responseText } }] }) + '\n\n');
           await write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) + '\n\n');
           await write('data: [DONE]\n\n');
@@ -1228,7 +1229,7 @@ async function chat(req, res, user) {
     : visionRequested
       ? [omni, 'meta/llama-3.2-90b-vision-instruct']
       : [...new Set(thinkPlan.chain)];
-  if (b.assistant === 'humanize') return await humanizeChatStream({ res, key, sys, msgs, modelChain, modelConfig: a, requestCtl, clientGone });
+  if (b.assistant === 'humanize') return await humanizeChatStream({ res, key, sys, msgs, modelChain, modelConfig: a, thinkPlan, requestCtl, clientGone });
   let lastProviderStatus = 0;
   let selectedModel = '';
   // Keep fallback attempts bounded: a slow first model must not make every
