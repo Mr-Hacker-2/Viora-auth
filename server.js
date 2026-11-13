@@ -1338,27 +1338,109 @@ async function chat(req, res, user) {
   };
   try {
     if (!verifyAnswer) {
-      const completion = createSseCompletionTracker();
-      const decoder = new TextDecoder();
-      const stripper = thinkPlan.applied ? createReasoningStripper() : null;
-      for await (const chunk of r.body) {
-        if (res.destroyed || clientGone) break;
-        const piece = decoder.decode(chunk, { stream: true });
-        completion.push(piece);
-        const forward = stripper ? stripper.push(piece) : chunk;
-        if (forward.length && !res.write(forward)) await new Promise(resolve => res.once('drain', resolve));
+      const firstIndex = Math.max(0, modelEntries.findIndex(model => model.id === selectedModel));
+      for (let modelIndex = firstIndex; modelIndex < modelEntries.length; modelIndex++) {
+        const modelConfig = modelEntries[modelIndex];
+        if (clientGone || res.destroyed) return;
+        if (modelIndex > firstIndex) {
+          const pause = modelHealth.get(modelEntries[modelIndex - 1].id)?.fails >= 1 ? 180 : 80;
+          await new Promise(resolve => setTimeout(resolve, pause));
+          await write('data: ' + JSON.stringify({ viora_retry: { model: modelConfig.id, reason: 'stream_recovery' } }) + '\n\n');
+          const retry = await requestProviderModel(modelConfig);
+          if (!retry.ok) {
+            const failure = { model: modelConfig.id, type: classifyModelFailure(retry), status: retry.status || null,
+              error: String(retry.error?.message || 'Provider request failed.') };
+            lastProviderStatus = retry.status || lastProviderStatus;
+            modelFail(modelConfig.id, failure.status); recordModelMetric(modelConfig.id, false, null);
+            queueAIReport({ type: failure.type, model: modelConfig.id, status: failure.status, description: failure.error,
+              recoveryStatus: modelIndex + 1 < modelEntries.length ? 'retrying' : 'all_models_failed',
+              fallbackModel: modelEntries[modelIndex + 1]?.id || '', requestId });
+            continue;
+          }
+          activeProviderResponse?.controller.abort();
+          if (activeProviderResponse) clearTimeout(activeProviderResponse.timer);
+          activeProviderResponse = retry.value; r = activeProviderResponse.response; selectedModel = modelConfig.id;
+          selectedHeaderMs = retry.latencyMs;
+          await write('data: ' + JSON.stringify({ viora_meta: { model: selectedModel, modelHeaderMs: selectedHeaderMs } }) + '\n\n');
+        }
+
+        const completion = createSseCompletionTracker(), decoder = new TextDecoder(), stripper = thinkPlan.applied ? createReasoningStripper() : null;
+        let pending = '', probe = '', sawContent = false, malformed = false, streamError = null;
+        const forwardEvent = async (event, separator) => {
+          let terminal = false;
+          for (const line of event.split(/\r?\n/)) {
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (!payload) continue;
+            if (payload === '[DONE]') { terminal = true; continue; }
+            try {
+              const item = JSON.parse(payload);
+              if (item.error) streamError = new Error('Provider stream returned an error.');
+              const choices = item.choices || [];
+              for (const choice of choices) {
+                if (choice?.finish_reason != null) terminal = true;
+                const text = choice?.delta?.content ?? choice?.message?.content;
+                if (typeof text === 'string' && text.length) sawContent = true;
+              }
+            } catch { malformed = true; }
+          }
+          if (terminal) { completion.push(event + separator); return true; }
+          const frame = event + separator;
+          probe = (probe + frame).slice(-3000);
+          if (/"content"\s*:\s*"(?:[^"\\]|\\.)+"/.test(probe)) sawContent = true;
+          const forward = stripper ? stripper.push(frame) : frame;
+          return forward ? write(forward) : true;
+        };
+        try {
+          for await (const chunk of r.body) {
+            if (res.destroyed || clientGone) break;
+            const piece = decoder.decode(chunk, { stream: true });
+            completion.push(piece);
+            pending += piece;
+            let boundary;
+            while ((boundary = /\r?\n\r?\n/.exec(pending))) {
+              const event = pending.slice(0, boundary.index), separator = boundary[0];
+              pending = pending.slice(boundary.index + separator.length);
+              await forwardEvent(event, separator);
+              if (res.destroyed || clientGone) break;
+            }
+          }
+        } catch {
+          streamError = new Error('Provider stream was interrupted.');
+        }
+        const tail = decoder.decode();
+        if (tail) { completion.push(tail); pending += tail; }
+        if (pending.trim() && !res.destroyed && !clientGone) await forwardEvent(pending, '');
+        if (activeProviderResponse) clearTimeout(activeProviderResponse.timer);
+        if (res.destroyed || clientGone) return;
+        if (completion.finish() && sawContent && !malformed && !streamError) {
+          if (stripper) { const rest = stripper.flush(); if (rest) await write(rest); }
+          const latencyMs = Date.now() - activeProviderResponse.startedAt;
+          recordModelMetric(selectedModel, true, latencyMs);
+          if (latencyMs > 15000) queueAIReport({ type: 'slow_response', model: selectedModel, status: 200,
+            description: 'Flash completed, but provider response latency exceeded 15 seconds.', latencyMs,
+            recoveryStatus: 'completed', requestId });
+          reportProgress('complete', 'Response complete');
+          await write('data: [DONE]\n\n');
+          if (!res.writableEnded) res.end();
+          return;
+        }
+        const failureType = streamError ? 'provider_error' : malformed || !sawContent ? 'invalid_response' : 'incomplete_response';
+        const failureDescription = streamError ? streamError.message : malformed ? 'Provider stream contained an invalid response event.' : !sawContent ? 'Provider stream completed without usable text.' : 'Provider stream ended before a completion marker.';
+        modelFail(selectedModel, lastProviderStatus); recordModelMetric(selectedModel, false, Date.now() - activeProviderResponse.startedAt);
+        queueAIReport({ type: failureType, model: selectedModel, status: lastProviderStatus || null,
+          description: failureDescription, recoveryStatus: modelIndex + 1 < modelEntries.length ? 'retrying' : 'all_models_failed',
+          fallbackModel: modelEntries[modelIndex + 1]?.id || '', requestId });
+        if (modelIndex + 1 >= modelEntries.length) {
+          await queueAIReport({ type: 'all_models_failed', model: selectedModel, status: lastProviderStatus || null,
+            description: 'Every configured Flash model failed to return a complete usable answer.', recoveryStatus: 'failed', requestId });
+          await flushAIReports();
+          await write('data: ' + JSON.stringify({ viora_incomplete: { message: 'Every configured model failed to complete this answer. Your original message is preserved; try again shortly.', requestId } }) + '\n\n');
+          await write('data: [DONE]\n\n');
+          if (!res.writableEnded) res.end();
+          return;
+        }
       }
-      completion.push(decoder.decode());
-      if (stripper && !res.destroyed && !clientGone) { const rest = stripper.flush(); if (rest) res.write(rest); }
-      if (res.destroyed || clientGone) return;
-      if (!completion.finish()) {
-        reportProgress('incomplete', 'The AI provider stream ended before a completion marker');
-        await write('data: ' + JSON.stringify({ viora_incomplete: { message: 'The provider stream ended before the answer was complete.' } }) + '\n\n');
-        if (!res.writableEnded) res.end();
-        return;
-      }
-      reportProgress('complete', 'Response complete');
-      if (!res.destroyed && !res.writableEnded) res.end();
       return;
     }
 
