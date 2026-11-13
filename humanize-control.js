@@ -3,7 +3,7 @@ export const MAX_HUMANIZE_WORDS = 5000;
 export const MAX_HUMANIZE_CHARS = 160000;
 
 export function humanizeWordCount(value) {
-  return (String(value || '').match(/[\\p{L}\\p{N}]+(?:['’][\\p{L}\\p{N}]+)*/gu) || []).length;
+  return (String(value || '').match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu) || []).length;
 }
 
 /* The Studio sends its draft as JSON at the end of the instruction. Accept raw JSON too for older clients. */
@@ -25,15 +25,15 @@ const trimUrl = value => value.replace(/[.,;:!?]+$/, '');
 const normalizeNumber = value => value.replace(/[$€£,]/g, '').replace(/\.0+(?=%?$)/, '');
 function protectedFacts(text) {
   const facts = new Set(), source = String(text || '');
-  const urls = source.match(/\\bhttps?:\\/\\/[^\\s)\\]>"']+|\\bwww\\.[^\\s)\\]>"']+/gi) || [];
+  const urls = source.match(/\bhttps?:\/\/[^\s)\]>"']+|\bwww\.[^\s)\]>"']+/gi) || [];
   for (const value of urls) facts.add('url:' + trimUrl(value).toLowerCase());
-  const emails = source.match(/\\b[\\w.+-]+@[\\w-]+\\.[\\w.-]+\\b/g) || [];
+  const emails = source.match(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g) || [];
   for (const value of emails) facts.add('email:' + value.toLowerCase());
-  const citations = source.match(/\\[\\d+(?:[,–-]\\s*\\d+)*\\]|\\([A-Z][A-Za-z'’-]+(?: et al\\.?| (?:and|&) [A-Z][A-Za-z'’-]+)?,? \\d{4}[a-z]?\\)/g) || [];
-  for (const value of citations) facts.add('citation:' + value.replace(/\\s+/g, ' '));
-  let bare = source.replace(/\\bhttps?:\\/\\/[^\\s)\\]>"']+|\\bwww\\.[^\\s)\\]>"']+/gi, ' ').replace(/\\b[\\w.+-]+@[\\w-]+\\.[\\w.-]+\\b/g, ' ');
-  for (const value of bare.match(/(?<![\\w.])[$€£]?\\d(?:[\\d,]*\\d)?(?:\\.\\d+)?%?/g) || []) facts.add('number:' + normalizeNumber(value));
-  for (const value of bare.match(/\\b(?:[A-Z]{2,}[A-Z0-9]*|[a-z]+[A-Z][A-Za-z0-9]*)\\b/g) || []) facts.add('identifier:' + value);
+  const citations = source.match(/\[\d+(?:[,–-]\s*\d+)*\]|\([A-Z][A-Za-z'’-]+(?: et al\.?| (?:and|&) [A-Z][A-Za-z'’-]+)?,? \d{4}[a-z]?\)/g) || [];
+  for (const value of citations) facts.add('citation:' + value.replace(/\s+/g, ' '));
+  let bare = source.replace(/\bhttps?:\/\/[^\s)\]>"']+|\bwww\.[^\s)\]>"']+/gi, ' ').replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, ' ');
+  for (const value of bare.match(/(?<![\w.])[$€£]?\d(?:[\d,]*\d)?(?:\.\d+)?%?/g) || []) facts.add('number:' + normalizeNumber(value));
+  for (const value of bare.match(/\b(?:[A-Z]{2,}[A-Z0-9]*|[a-z]+[A-Z][A-Za-z0-9]*)\b/g) || []) facts.add('identifier:' + value);
   return facts;
 }
 
