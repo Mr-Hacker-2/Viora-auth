@@ -6,7 +6,7 @@ import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { contextualResearchQuery, heuristicResearchDecision, researchLimits, researchMode, researchReviewRequiresRetry, shouldReviewResearchAnswer } from './research.js';
 import { buildResearchContext, searchWeb } from './web-search.js';
 import { createSseCompletionTracker } from './stream-completion.js';
-import { DEFAULT_FLASH_MODELS, fallbackModels, normalizeFlashConfig, runModelFallback, sanitizeProviderError } from './flash-control.js';
+import { DEFAULT_FLASH_MODELS, fallbackModels, normalizeFlashConfig, runModelFallback, sanitizeProviderError, trimConversationMessages } from './flash-control.js';
 import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
 import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, createReasoningStripper, stripReasoningFromEvent } from './think.js';
 import { accountFlowDecision } from './auth-flow.js';
@@ -1070,7 +1070,7 @@ async function chat(req, res, user) {
   const thinkBoost = thinkPlan.applied && !videoRequested && !audioRequested && !visionRequested;
   if (thinkPlan.requested) runtimeMetrics.thinkRequests++;
   if (thinkPlan.upgraded) key = process.env[`NVIDIA_${ASSIST[thinkPlan.lane].env}_KEY`] || process.env.NVIDIA_API_KEY || key;
-  const msgs = b.messages.slice(-24).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, 20000) }));
+  const msgs = trimConversationMessages(b.messages);
   const plainMsgs = msgs.map((m) => ({ role: m.role, content: m.content }));
   const lastUserText = String([...plainMsgs].reverse().find((m) => m.role === 'user')?.content || '');
   if (researchRequestId && webEnabled) reportProgress('understand', 'Understanding your request and conversation');
