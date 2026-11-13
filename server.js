@@ -1252,13 +1252,14 @@ async function chat(req, res, user) {
         : [...new Set(thinkPlan.chain)].map(id => ({ id, enabled: true, timeoutMs: thinkBoost ? THINK_LIMITS.providerHeaderMs : 12000, provider: 'NVIDIA NIM' }));
   const modelChain = modelEntries.map(model => model.id);
   const requestId = crypto.randomUUID();
-  const modelDeadline = Date.now() + 60000;
+  const modelDeadline = Date.now() + 120000;
   let lastProviderStatus = 0, selectedModel = '', selectedHeaderMs = 0;
   const requestProviderModel = async modelConfig => {
     const model = modelConfig.id, startedAt = Date.now(), remaining = modelDeadline - startedAt;
     if (remaining <= 0) return { ok: false, error: Object.assign(new Error('Provider request timed out.'), { name: 'TimeoutError' }) };
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.min(modelConfig.timeoutMs || 12000, remaining));
+    const timer = setTimeout(() => controller.abort(), Math.min(modelConfig.timeoutMs || 30000, remaining));
+    let keepTimer = false;
     try {
       const response = await fetch(`${NV}/chat/completions`, {
         method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
@@ -1275,10 +1276,11 @@ async function chat(req, res, user) {
       if (!response.ok) { lastProviderStatus = response.status; await response.body?.cancel().catch(() => {}); return { ok: false, status: response.status, error: new Error(response.status === 429 ? 'Provider rate limited the request.' : 'Provider returned HTTP ' + response.status + '.') }; }
       const type = String(response.headers.get('content-type') || '').toLowerCase();
       if (!response.body || (type && !type.includes('text/event-stream'))) { await response.body?.cancel().catch(() => {}); return { ok: false, status: response.status, usable: false, error: new Error('Provider returned an invalid stream response.') }; }
-      return { ok: true, value: response, latencyMs };
-    } catch (error) {
+      keepTimer = true;
+      return { ok: true, value: { response, controller, timer, startedAt }, latencyMs };
+    } catch {
       return { ok: false, error: controller.signal.aborted && !requestCtl.signal.aborted ? Object.assign(new Error('Provider request timed out.'), { name: 'TimeoutError' }) : requestCtl.signal.aborted ? new Error('Request cancelled.') : new Error('Provider connection failed.') };
-    } finally { clearTimeout(timer); }
+    } finally { if (!keepTimer) clearTimeout(timer); }
   };
   const selection = await runModelFallback(modelEntries, requestProviderModel, {
     onFailure: (failure, model, index) => {
@@ -1290,8 +1292,10 @@ async function chat(req, res, user) {
         fallbackModel: modelEntries[index + 1]?.id || '', requestId });
     }
   });
+  let activeProviderResponse = null;
   if (selection.ok) {
-    r = selection.result.value; selectedModel = selection.model.id; selectedHeaderMs = selection.result.latencyMs;
+    activeProviderResponse = selection.result.value;
+    r = activeProviderResponse.response; selectedModel = selection.model.id; selectedHeaderMs = selection.result.latencyMs;
     if (selection.failures.length) queueAIReport({ type: 'model_switch', model: selection.failures.at(-1).model, status: selection.failures.at(-1).status,
       description: 'Flash recovered by switching to the next configured model.', recoveryStatus: 'recovered', fallbackModel: selectedModel, requestId });
   }
