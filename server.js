@@ -52,6 +52,7 @@ const back = (res, st, params) => {
 
 /* ================= AI proxy: keys live here, never in the website ================= */
 const NV = (process.env.NVIDIA_API_URL || process.env.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '');
+const HUMANIZER_MODEL_CHAIN = [...new Set(String(process.env.HUMANIZER_MODELS || '').split(',').map(id => id.trim()).filter(id => /^[a-z0-9][a-z0-9._/-]{2,127}$/i.test(id)))].slice(0, 12);
 const ASSIST = {
   flash:   { env: 'FLASH',   t: 0.6,  chain: ['nvidia/nemotron-3.5-lightning-30b-a3b', 'deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'],
     sys: systemFor('flash') },
@@ -59,7 +60,7 @@ const ASSIST = {
     sys: systemFor('search') },
   math:    { env: 'MATH',    t: 0.2,  chain: ['moonshotai/kimi-k3', 'nvidia/nemotron-3-ultra-550b-a55b', 'deepseek-ai/deepseek-v4.1-flash'],
     sys: systemFor('math') },
-  humanize:{ env: 'HUMANIZER',t: 0.85, chain: ['moonshotai/kimi-k3', 'deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3'],
+  humanize:{ env: 'HUMANIZER',t: 0.85, chain: HUMANIZER_MODEL_CHAIN.length ? HUMANIZER_MODEL_CHAIN : ['moonshotai/kimi-k3', 'deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3'],
     sys: systemFor('humanize') }
 };
 /* Per-model circuit breaker: three failures in a row take a model out of rotation for a minute (20 s after a rate limit),
