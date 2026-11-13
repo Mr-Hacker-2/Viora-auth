@@ -29,8 +29,8 @@ async function setup({ alwaysShort = false } = {}) {
       return res.end();
     }
     res.write(frame({ choices: [{ delta: { content: text } }] }));
-    if (!alwaysShort) res.write(frame({ choices: [{ delta: {}, finish_reason: 'stop' }] }));
-    res.end(alwaysShort ? '' : 'data: [DONE]\\n\\n');
+    res.write(frame({ choices: [{ delta: {}, finish_reason: 'stop' }] }));
+    res.end('data: [DONE]\\n\\n');
   });
   await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
   const serverPort = await freePort();
