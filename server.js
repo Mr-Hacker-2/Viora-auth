@@ -1317,6 +1317,7 @@ async function chat(req, res, user) {
     'X-Accel-Buffering': 'no',
     ...cors()
   });
+  res.write('data: ' + JSON.stringify({ viora_meta: { model: selectedModel, modelHeaderMs: selectedHeaderMs } }) + '\n\n');
   if (shouldResearch) {
     res.write('data: ' + JSON.stringify({
       viora_sources: publicSources,
