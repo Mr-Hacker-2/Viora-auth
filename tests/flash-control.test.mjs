@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_FLASH_MODELS, fallbackModels, normalizeFlashConfig,
-  runModelFallback, classifyModelFailure, sanitizeProviderError
+  runModelFallback, classifyModelFailure, sanitizeProviderError, trimConversationMessages
 } from '../flash-control.js';
 
 const ok = value => ({ ok: true, value });
@@ -78,4 +78,23 @@ test('concurrent users can execute fallback without serializing one another', as
   const execute = async (_model, i) => { if(i) return ok('done'); active++; peak=Math.max(peak,active); await new Promise(r=>setTimeout(r,20)); active--; return fail(503); };
   await Promise.all(Array.from({length:4},()=>runModelFallback(DEFAULT_FLASH_MODELS,execute)));
   assert.ok(peak > 1);
+});
+
+test('conversation trimming keeps the original latest user message and recent context in order', () => {
+  const messages = [
+    {role:'user',content:'old'.repeat(5000)},
+    {role:'assistant',content:'reply '.repeat(1000)},
+    {role:'user',content:'my complete original request'}
+  ];
+  const trimmed = trimConversationMessages(messages,{maxTotalChars:120,maxPriorMessageChars:40,maxLatestUserChars:60});
+  assert.equal(trimmed.at(-1).content,'my complete original request');
+  assert.deepEqual(trimmed.map(x=>x.role),['assistant','user']);
+  assert.ok(trimmed.reduce((n,x)=>n+x.content.length,0)<=120);
+});
+test('conversation trimming preserves role order and caps very long latest messages', () => {
+  const text='X'.repeat(50000);
+  const trimmed=trimConversationMessages([{role:'user',content:'question'},{role:'assistant',content:'answer'},{role:'user',content:text}]);
+  assert.equal(trimmed.at(-1).content.length,20000);
+  assert.equal(trimmed.at(-1).content[0],'X');
+  assert.deepEqual(trimmed.map(x=>x.role),['user','assistant','user']);
 });
