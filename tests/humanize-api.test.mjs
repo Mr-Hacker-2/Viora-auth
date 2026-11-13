@@ -37,7 +37,7 @@ async function setup({ alwaysShort = false } = {}) {
   const child = spawn(process.execPath, ['server.js'], {
     cwd: root, stdio: 'ignore',
     env: { ...process.env, PORT: String(serverPort), SITE_URL: 'http://127.0.0.1', GOOGLE_CLIENT_ID: 'x', GOOGLE_CLIENT_SECRET: 'x',
-      TOKEN_SECRET: secret, NVIDIA_API_KEY: 'test-key', NVIDIA_API_URL: 'http://127.0.0.1:' + provider.address().port }
+      TOKEN_SECRET: secret, HUMANIZER_MODELS: '', NVIDIA_API_KEY: 'test-key', NVIDIA_API_URL: 'http://127.0.0.1:' + provider.address().port }
   });
   const base = 'http://127.0.0.1:' + serverPort;
   for (let i = 0; i < 100; i++) { try { if ((await fetch(base)).ok) break; } catch {} await new Promise(resolve => setTimeout(resolve, 100)); }
@@ -58,7 +58,7 @@ test('a complete 12-word stream is discarded and the next model supplies the ful
   const output = events.map(event => event.choices?.[0]?.delta?.content || '').join('');
   assert.equal(result.status, 200);
   assert.ok(events.some(event => event.viora_retry), 'fallback is reported');
-  assert.equal(ctx.calls.length, 2);
+  assert.deepEqual(ctx.calls, ['moonshotai/kimi-k3', 'deepseek-ai/deepseek-v4.1-flash']);
   assert.equal(output.split(/\s+/).filter(Boolean).length, 700);
   assert.doesNotMatch(result.text, /This answer is only twelve words/);
   assert.match(result.text, /data: \[DONE\]/);
@@ -78,7 +78,7 @@ test('if every model returns a short answer, no rewrite text is exposed as compl
   const draft = Array.from({ length: 1119 }, (_, i) => 'draft' + i).join(' ');
   const result = await humanize(ctx.base, draft);
   const events = [...result.text.matchAll(/^data: (\{.*\})$/gm)].map(match => JSON.parse(match[1]));
-  assert.equal(ctx.calls.length, 3);
+  assert.deepEqual(ctx.calls, ['moonshotai/kimi-k3', 'deepseek-ai/deepseek-v4.1-flash', 'z-ai/glm-5.3']);
   assert.ok(events.some(event => event.viora_incomplete));
   assert.equal(events.flatMap(event => event.choices?.[0]?.delta?.content || '').join(''), '');
   assert.match(result.text, /data: \[DONE\]/);
