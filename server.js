@@ -6,6 +6,7 @@ import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { contextualResearchQuery, heuristicResearchDecision, researchLimits, researchMode, researchReviewRequiresRetry, shouldReviewResearchAnswer } from './research.js';
 import { buildResearchContext, searchWeb } from './web-search.js';
 import { createSseCompletionTracker } from './stream-completion.js';
+import { DEFAULT_FLASH_MODELS, fallbackModels, normalizeFlashConfig, runModelFallback, sanitizeProviderError } from './flash-control.js';
 import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
 import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, createReasoningStripper, stripReasoningFromEvent } from './think.js';
 import { accountFlowDecision } from './auth-flow.js';
@@ -67,6 +68,49 @@ const modelHealth = new Map();
 const modelUp = m => (modelHealth.get(m)?.until || 0) <= Date.now();
 const modelOk = m => { modelHealth.delete(m); };
 const modelFail = (m, status) => { const e = modelHealth.get(m) || { fails: 0, until: 0 }; e.fails++; if (e.fails >= 3) e.until = Date.now() + (status === 429 ? 20000 : 60000); modelHealth.set(m, e); };
+const modelRuntime = new Map();
+const FLASH_CONFIG_KEY = 'admin/flash-models.json';
+let flashConfigCache = null, flashConfigCacheUntil = 0, flashConfigWrite = Promise.resolve();
+async function readFlashConfig(force = false) {
+  if (!force && flashConfigCache && flashConfigCacheUntil > Date.now()) return flashConfigCache;
+  if (!b2Ready()) return flashConfigCache = normalizeFlashConfig(DEFAULT_FLASH_MODELS);
+  try { const saved = await getJson(FLASH_CONFIG_KEY); flashConfigCache = normalizeFlashConfig(saved || DEFAULT_FLASH_MODELS); }
+  catch (error) { console.error('Flash model settings could not be read:', error?.message || error); if (!flashConfigCache) flashConfigCache = normalizeFlashConfig(DEFAULT_FLASH_MODELS); }
+  flashConfigCacheUntil = Date.now() + 15000;
+  return flashConfigCache;
+}
+async function saveFlashConfig(value) {
+  const config = normalizeFlashConfig(value);
+  if (!b2Ready()) throw new Error('storage_off');
+  flashConfigWrite = flashConfigWrite.then(async () => { await putJson(FLASH_CONFIG_KEY, config); flashConfigCache = config; flashConfigCacheUntil = Date.now() + 15000; });
+  await flashConfigWrite;
+  return config;
+}
+function recordModelMetric(id, ok, latencyMs) {
+  const old = modelRuntime.get(id) || { successCount: 0, failureCount: 0, lastLatencyMs: null, lastStatus: 'not_tested', lastAt: null };
+  old[ok ? 'successCount' : 'failureCount']++;
+  old.lastLatencyMs = Number.isFinite(latencyMs) ? Math.max(0, Math.round(latencyMs)) : null;
+  old.lastStatus = ok ? 'healthy' : 'unreachable'; old.lastAt = new Date().toISOString(); modelRuntime.set(id, old);
+  if (ok) modelOk(id);
+}
+async function writeAIReport(data) {
+  if (!b2Ready()) return false;
+  const id = Date.now() + '_' + crypto.randomUUID();
+  const report = { id, at: new Date().toISOString(), type: String(data.type || 'provider_error').slice(0, 60),
+    model: String(data.model || '').slice(0, 140), provider: 'NVIDIA NIM', status: Number.isInteger(data.status) ? data.status : null,
+    description: sanitizeProviderError(data.description, [process.env.NVIDIA_API_KEY, process.env.NVIDIA_FLASH_KEY]),
+    recoveryStatus: String(data.recoveryStatus || 'failed').slice(0, 40), fallbackModel: String(data.fallbackModel || '').slice(0, 140),
+    requestId: String(data.requestId || '').slice(0, 80), state: 'open' };
+  try { await putJson('ai/errors/' + id + '.json', report); return true; }
+  catch (error) { console.error('AI report could not be persisted:', error?.message || error); return false; }
+}
+const pendingAIReports = new Set();
+function queueAIReport(data) {
+  const task = writeAIReport(data).finally(() => pendingAIReports.delete(task));
+  pendingAIReports.add(task); return task;
+}
+async function flushAIReports() { await Promise.allSettled([...pendingAIReports]); }
+
 /* The same message submitted twice within a few seconds (double tap, double submit) is answered once. */
 const inflightChats = new Map();
 const hits = new Map();
