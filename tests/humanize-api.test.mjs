@@ -30,7 +30,7 @@ async function setup({ alwaysShort = false } = {}) {
     }
     res.write(frame({ choices: [{ delta: { content: text } }] }));
     res.write(frame({ choices: [{ delta: {}, finish_reason: 'stop' }] }));
-    res.end('data: [DONE]\\n\\n');
+    res.end('data: [DONE]\n\n');
   });
   await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
   const serverPort = await freePort();
@@ -60,7 +60,7 @@ test('a complete 12-word stream is discarded and the next model supplies the ful
   assert.ok(events.some(event => event.viora_retry), 'fallback is reported');
   assert.equal(ctx.calls.length, 2);
   assert.equal(output.split(/\s+/).filter(Boolean).length, 700);
-  assert.doesNotMatch(result.text, /This is a very short answer/);
+  assert.doesNotMatch(result.text, /This answer is only twelve words/);
   assert.match(result.text, /data: \[DONE\]/);
 });
 
@@ -77,9 +77,9 @@ test('if every model returns a short answer, no rewrite text is exposed as compl
   const ctx = await setup({ alwaysShort: true }); t.after(() => { ctx.child.kill(); ctx.provider.close(); });
   const draft = Array.from({ length: 1119 }, (_, i) => 'draft' + i).join(' ');
   const result = await humanize(ctx.base, draft);
-  const events = [...result.text.matchAll(/^data: (\\{.*\\})$/gm)].map(match => JSON.parse(match[1]));
+  const events = [...result.text.matchAll(/^data: (\{.*\})$/gm)].map(match => JSON.parse(match[1]));
   assert.equal(ctx.calls.length, 3);
   assert.ok(events.some(event => event.viora_incomplete));
   assert.equal(events.flatMap(event => event.choices?.[0]?.delta?.content || '').join(''), '');
-  assert.match(result.text, /data: \\[DONE\\]/);
+  assert.match(result.text, /data: \[DONE\]/);
 });
