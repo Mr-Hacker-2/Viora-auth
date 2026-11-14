@@ -1555,7 +1555,10 @@ http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/verify') {
-      const o = unsign(u.searchParams.get('token'));
+      // The website sends the session token in the Authorization header so it never appears in a URL.
+      // The ?token= form is still accepted so older cached pages and the extension keep working.
+      const bearer = (req.headers.authorization || '').replace(/^Bearer /, '');
+      const o = unsign(bearer || u.searchParams.get('token'));
       const valid = !!(o && o.email && await accountAllowed(o.email));
       res.writeHead(valid ? 200 : 401, { 'Content-Type': 'application/json', ...cors() });
       return res.end(JSON.stringify(valid ? { email: o.email, name: o.name, picture: o.picture } : { error: 'invalid' }));
