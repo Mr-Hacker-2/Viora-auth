@@ -11,6 +11,7 @@ import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGui
 import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, createReasoningStripper, stripReasoningFromEvent } from './think.js';
 import { accountFlowDecision } from './auth-flow.js';
 import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
+import { makeTokens, tokenFromRequest } from './token.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
 const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
@@ -27,19 +28,7 @@ if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !TOKEN_SECRET) {
   console.error('Missing env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET');
 }
 
-const b64 = (b) => Buffer.from(b).toString('base64url');
-const sign = (obj) => {
-  const p = b64(JSON.stringify(obj));
-  return p + '.' + crypto.createHmac('sha256', TOKEN_SECRET).update(p).digest('base64url');
-};
-const unsign = (t) => {
-  const [p, s] = String(t || '').split('.');
-  if (!p || !s) return null;
-  const good = crypto.createHmac('sha256', TOKEN_SECRET).update(p).digest('base64url');
-  if (s.length !== good.length || !crypto.timingSafeEqual(Buffer.from(s), Buffer.from(good))) return null;
-  const o = JSON.parse(Buffer.from(p, 'base64url').toString());
-  return o.exp > Date.now() ? o : null;
-};
+const { sign, unsign } = makeTokens(TOKEN_SECRET);
 // Send the result back to the extension (ext) or to the website (site mode).
 const back = (res, st, params) => {
   const page = st.mode === 'signup' ? 'signup' : 'login';
@@ -1555,7 +1544,7 @@ http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/verify') {
-      const o = unsign(u.searchParams.get('token'));
+      const o = unsign(tokenFromRequest(req, u));
       const valid = !!(o && o.email && await accountAllowed(o.email));
       res.writeHead(valid ? 200 : 401, { 'Content-Type': 'application/json', ...cors() });
       return res.end(JSON.stringify(valid ? { email: o.email, name: o.name, picture: o.picture } : { error: 'invalid' }));
