@@ -10,6 +10,7 @@ import { MAX_HUMANIZE_CHARS, MAX_HUMANIZE_WORDS, extractHumanizeDraft, humanizeW
 import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
 import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, createReasoningStripper, stripReasoningFromEvent } from './think.js';
 import { accountFlowDecision } from './auth-flow.js';
+import { clientIp, seenUpdate, cleanLocation, locationPrompt, adminLocation, NO_LOCATION_PROMPT } from './visitor.js';
 import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
@@ -98,6 +99,20 @@ const userOf = async req => {
   if (!user || !user.email) return null;
   return await accountAllowed(user.email) ? { ...user, email: normEmail(user.email) } : null;
 };
+
+/* The IP address each account last connected from, shown to the administrator (see the Terms and Privacy Policy).
+   Written at most every 10 minutes per account, or when the address changes, so chatting does not write to storage on every message. */
+const seenCache = new Map();
+async function recordSeen(email, ip) {
+  if (!ip || !b2Ready()) return;
+  const who = normEmail(email), hit = seenCache.get(who), now = Date.now();
+  if (hit && hit.ip === ip && now - hit.at < 10 * 60e3) return;
+  seenCache.set(who, { ip, at: now });
+  try {
+    const key = userKey(who), rec = await getJson(key);
+    if (rec) await putJson(key, { ...rec, ...seenUpdate(rec, ip, new Date(now).toISOString()) });
+  } catch (e) { seenCache.delete(who); console.warn('Could not record the visitor address:', e?.message || e); }
+}
 
 async function writeAdminAudit(actor, action, target, outcome, details = {}) {
   if (!b2Ready()) return;
@@ -697,10 +712,14 @@ async function handleAdmin(req, res, u) {
         role: ADMIN_EMAILS.has(normEmail(row.email)) || row.role === 'admin' ? 'admin' : 'user',
         roleManagedBy: ADMIN_EMAILS.has(normEmail(row.email)) ? 'server environment' : 'admin',
         provider: row.provider === 'password' ? 'password' : 'google', emailVerified: row.provider === 'password' ? row.emailVerified === true : true,
-        status: row.status === 'suspended' ? 'suspended' : 'active'
+        status: row.status === 'suspended' ? 'suspended' : 'active',
+        lastIp: String(row.lastIp || '').slice(0, 45), lastSeenAt: row.lastSeenAt || null,
+        ips: Array.isArray(row.ips) ? row.ips.slice(0, 10).map(e => ({ ip: String((e && e.ip) || '').slice(0, 45), firstAt: (e && e.firstAt) || null, lastAt: (e && e.lastAt) || null })) : [],
+        location: adminLocation(row)
       })).filter(row => !query || (row.email + ' ' + row.name).toLowerCase().includes(query))
         .sort((a, b) => String(b.lastLoginAt || '').localeCompare(String(a.lastLoginAt || '')));
       const start = (page - 1) * perPage;
+      await writeAdminAudit(actor, 'admin_viewed_user_ips_and_locations', 'users', 'success', { page, perPage, searched: !!query });
       return json(res, 200, { users: sorted.slice(start, start + perPage), total: truncated ? null : sorted.length, page, perPage, truncated });
     } catch (error) {
       return json(res, 503, { error: error.message === 'storage_off' ? 'Account storage is not configured.' : 'Account records could not be read.' });
@@ -1111,6 +1130,11 @@ async function chat(req, res, user) {
   if (b.context && typeof b.context.instructions === 'string' && b.context.instructions.trim()) {
     sys += '\n\nAdditional response guidance from the user\'s Viora settings (max 8,000 characters; follow when consistent with accuracy and safety):\n' + b.context.instructions.slice(0, 8000);
   }
+  // A location the person chose to share is background data about them. Without one, the model is told to ask rather than guess.
+  if (b.assistant !== 'humanize') {
+    const shared = cleanLocation(b.context && b.context.location);
+    sys += '\n\n' + (shared ? locationPrompt(shared) : NO_LOCATION_PROMPT);
+  }
   // Answers from the sign-up questions, stored in Backblaze. Fixed labels only, so this is safe, but still background data.
   try {
     const about = profileText(await cachedAnswers(user.email));
@@ -1477,7 +1501,7 @@ http.createServer(async (req, res) => {
       const user = await userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
       if (limited(user.email)) return json(res, 429, { error: 'Slow down a little, then try again.' });
-      if (u.pathname === '/api/chat') return await chat(req, res, user);
+      if (u.pathname === '/api/chat') { void recordSeen(user.email, clientIp(req)); return await chat(req, res, user); }
       try { const { url } = await readBody(req, 5000); return json(res, 200, textOf(await safeFetch(String(url || '')))); }
       catch (e) { return json(res, 400, { error: e.message || 'Could not read that page.' }); }
     }
@@ -1529,6 +1553,34 @@ http.createServer(async (req, res) => {
       return back(res, st, { token: sign({ ...user, exp: Date.now() + 30 * 864e5 }), ...user });
     }
 
+    // A location the person chose to share (their browser asked first). Stored on their account so the administrator can see it; they can clear it.
+    if (req.method === 'POST' && u.pathname === '/api/location') {
+      const user = await userOf(req);
+      if (!user) return json(res, 401, { error: 'Please sign in again.' });
+      if (limited(user.email)) return json(res, 429, { error: 'Slow down a little, then try again.' });
+      if (!b2Ready()) return json(res, 503, { error: 'storage_off' });
+      let body; try { body = await readBody(req, 1000); } catch { return json(res, 400, { error: 'Invalid location request.' }); }
+      try {
+        const key = userKey(user.email), rec = await getJson(key);
+        if (!rec) return json(res, 404, { error: 'Account not found.' });
+        if (body.clear === true) {
+          const { location: _removed, ...rest } = rec;
+          await putJson(key, rest);
+          await writeAdminAudit(user.email, 'location_cleared', user.email, 'success');
+          return json(res, 200, { ok: true });
+        }
+        const loc = cleanLocation(body);
+        if (!loc) return json(res, 400, { error: 'That location is not valid.' });
+        const at = new Date().toISOString(), ip = clientIp(req);
+        await putJson(key, { ...rec, location: { ...loc, at, ip }, ...seenUpdate(rec, ip, at) });
+        await writeAdminAudit(user.email, 'location_shared', user.email, 'success');
+        return json(res, 200, { ok: true });
+      } catch (e) {
+        console.error('location save failed:', e?.message || e);
+        return json(res, 502, { error: 'Could not save your location. Please try again.' });
+      }
+    }
+
     // The sign-up questions and this user's saved answers (stored in Backblaze B2).
     if (u.pathname === '/api/profile') {
       const user = await userOf(req);
@@ -1560,6 +1612,7 @@ http.createServer(async (req, res) => {
       const bearer = (req.headers.authorization || '').replace(/^Bearer /, '');
       const o = unsign(bearer || u.searchParams.get('token'));
       const valid = !!(o && o.email && await accountAllowed(o.email));
+      if (valid) void recordSeen(o.email, clientIp(req));
       res.writeHead(valid ? 200 : 401, { 'Content-Type': 'application/json', ...cors() });
       return res.end(JSON.stringify(valid ? { email: o.email, name: o.name, picture: o.picture } : { error: 'invalid' }));
     }
