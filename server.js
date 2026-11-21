@@ -7,6 +7,7 @@ import { contextualResearchQuery, heuristicResearchDecision, researchLimits, res
 import { buildResearchContext, searchWeb } from './web-search.js';
 import { createSseCompletionTracker } from './stream-completion.js';
 import { MAX_HUMANIZE_CHARS, MAX_HUMANIZE_WORDS, extractHumanizeDraft, humanizeWordCount, validateHumanizeOutput } from './humanize-control.js';
+import { createVoiceService } from './transcribe.js';
 import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
 import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, createReasoningStripper, stripReasoningFromEvent } from './think.js';
 import { accountFlowDecision } from './auth-flow.js';
@@ -81,6 +82,10 @@ function setResearchState(id, owner, step, detail) {
   researchStates.set(id, { owner, step, detail: String(detail || '').slice(0, 180), expiresAt: now + 2 * 60e3 });
 }
 const limited = (k) => { const n = Date.now(), a = (hits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); hits.set(k, a); return a.length > 40; };
+/* Voice transcription has its own budget so dictation never uses up the chat allowance (20 recordings a minute per account). */
+const voiceHits = new Map();
+const voiceLimited = (k) => { const n = Date.now(), a = (voiceHits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); voiceHits.set(k, a); return a.length > 20; };
+const voice = createVoiceService();
 const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Vary': 'Origin' });
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', ...cors() }); res.end(JSON.stringify(obj)); };
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
@@ -1496,6 +1501,14 @@ http.createServer(async (req, res) => {
       const id = u.searchParams.get('id') || '', state = researchStates.get(id);
       if (!state || state.expiresAt <= Date.now() || state.owner !== user.email) return json(res, 404, { error: 'Research progress is unavailable.' });
       return json(res, 200, { step: state.step, detail: state.detail });
+    }
+    if (u.pathname === '/api/transcribe') {
+      const user = await userOf(req);
+      if (!user) return json(res, 401, { error: 'Please sign in again.' });
+      if (req.method === 'GET') return json(res, 200, await voice.status());
+      if (req.method !== 'POST') return json(res, 405, { error: 'Use POST with the recorded audio.' });
+      if (voiceLimited(user.email)) return json(res, 429, { code: 'rate_limited', error: 'Slow down a little, then try again.' });
+      return await voice.handle(req, res, u, { json, user });
     }
     if (u.pathname === '/api/chat' || u.pathname === '/api/read') {
       const user = await userOf(req);
