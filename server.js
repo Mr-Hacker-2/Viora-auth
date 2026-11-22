@@ -5,7 +5,7 @@ import { b2Ready, getJson, putJson, userKey, listKeys, putObject, getObject, del
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { contextualResearchQuery, heuristicResearchDecision, researchLimits, researchMode, researchReviewRequiresRetry, shouldReviewResearchAnswer } from './research.js';
 import { buildResearchContext, searchWeb } from './web-search.js';
-import { createSseCompletionTracker } from './stream-completion.js';
+import { createSseCompletionTracker, peekForContent, replayStream } from './stream-completion.js';
 import { MAX_HUMANIZE_CHARS, MAX_HUMANIZE_WORDS, extractHumanizeDraft, humanizeWordCount, validateHumanizeOutput } from './humanize-control.js';
 import { createVoiceService } from './transcribe.js';
 import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
@@ -1272,7 +1272,7 @@ async function chat(req, res, user) {
       ? [omni, 'meta/llama-3.2-90b-vision-instruct']
       : [...new Set(thinkPlan.chain)];
   if (b.assistant === 'humanize') return await humanizeChatStream({ res, key, sys, msgs, modelChain, modelConfig: a, thinkPlan, requestCtl, clientGone });
-  let lastProviderStatus = 0;
+  let lastProviderStatus = 0, sawEmptyAnswer = false, bodyIter = null;
   let selectedModel = '';
   // Keep fallback attempts bounded: a slow first model must not make every
   // subsequent model wait another full 30 seconds.
@@ -1307,6 +1307,11 @@ async function chat(req, res, user) {
         clearTimeout(providerTimer);
       }
       if (attempt.ok && attempt.body) {
+        /* A model that answers 200 but writes nothing (or only hidden reasoning) is a failure, not a reply: look at the
+           first part of the stream before committing, and move on to the next model if there is no answer text. */
+        const peek = await peekForContent(attempt.body, { timeoutMs: videoRequested || audioRequested || visionRequested || thinkBoost ? 60000 : 30000 });
+        if (!peek.ok) { sawEmptyAnswer = true; console.warn(`AI model ${model} produced no answer (${peek.reason})`); continue; }
+        bodyIter = replayStream(peek);
         r = attempt;
         selectedModel = model;
         console.info(`AI provider selected: ${model}`);
@@ -1323,7 +1328,9 @@ async function chat(req, res, user) {
   if (!r) {
     const message = lastProviderStatus === 401 || lastProviderStatus === 403
       ? 'The AI provider rejected the server key or model access. Please contact the site owner.'
-      : 'All available AI models failed or timed out. Please retry in a moment.';
+      : sawEmptyAnswer
+        ? 'The AI models returned an empty answer. Please retry, or pick another assistant.'
+        : 'All available AI models failed or timed out. Please retry in a moment.';
     return json(res, 502, {
       error: message,
       ...(shouldResearch ? { viora_sources: publicSources, viora_research: publicResearch, viora_timings: publicTimings } : {})
@@ -1359,7 +1366,7 @@ async function chat(req, res, user) {
       const completion = createSseCompletionTracker();
       const decoder = new TextDecoder();
       const stripper = thinkPlan.applied ? createReasoningStripper() : null;
-      for await (const chunk of r.body) {
+      for await (const chunk of bodyIter) {
         if (res.destroyed || clientGone) break;
         const piece = decoder.decode(chunk, { stream: true });
         completion.push(piece);
@@ -1402,7 +1409,7 @@ async function chat(req, res, user) {
       if (!outEvent) return true;
       return write(outEvent + separator);
     };
-    for await (const chunk of r.body) {
+    for await (const chunk of bodyIter) {
       if (res.destroyed || clientGone) break;
       const decoded = decoder.decode(chunk, { stream: true });
       pending += decoded;
@@ -1496,7 +1503,11 @@ async function chat(req, res, user) {
     }
   } catch (e) {
     console.error('AI stream failed:', e?.message || e);
-    if (!res.destroyed && !res.writableEnded) res.end();
+    /* The provider connection dropped part-way. Say so, so the website shows "incomplete" with a retry instead of a silently short answer. */
+    if (!res.destroyed && !res.writableEnded) {
+      try { res.write('data: ' + JSON.stringify({ viora_incomplete: { message: 'The connection to the AI provider dropped before the answer was complete.' } }) + '\n\n'); } catch {}
+      res.end();
+    }
   }
 }
 
