@@ -223,3 +223,45 @@ test('GET is the only other method allowed', async (t) => {
   const r = await fetch(srv.base + '/api/transcribe', { method: 'DELETE', headers: { Authorization: 'Bearer ' + makeToken('a@example.com') } });
   assert.equal(r.status, 405);
 });
+
+test('admin voice panel: stats count outcomes without storing audio or text; kill switch works and is admin-only', async (t) => {
+  const groq = await mockGroq();
+  const srv = await startServer({ GROQ_API_KEY: GROQ_KEY, GROQ_API_URL: groq.url, ADMIN_EMAILS: 'boss@example.com' });
+  t.after(() => { srv.child.kill(); groq.close(); });
+  const admin = makeToken('boss@example.com'), user = makeToken('voice@example.com');
+  const adminGet = (token = admin) => fetch(srv.base + '/api/admin/voice', { headers: token ? { Authorization: 'Bearer ' + token } : {} });
+  const setEnabled = (enabled, token = admin) => fetch(srv.base + '/api/admin/voice/enabled', { method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+
+  assert.equal((await adminGet(null)).status, 401);
+  assert.equal((await adminGet(user)).status, 403, 'ordinary accounts cannot read voice stats');
+  assert.equal((await setEnabled(false, user)).status, 403, 'ordinary accounts cannot flip the switch');
+
+  assert.equal((await post(srv, WEBM_MARKED)).status, 200);
+  assert.equal((await post(srv, WEBM_MARKED)).status, 200);
+  assert.equal((await post(srv, Buffer.from('not audio at all, just text padding'.repeat(60)))).status, 415);
+  groq.state.status = 500; assert.equal((await post(srv, WEBM_MARKED)).status, 502); groq.state.status = 200;
+
+  const d = await (await adminGet()).json();
+  assert.equal(d.enabled, true); assert.equal(d.configured.groq, true);
+  assert.equal(d.stats.requests, 4); assert.equal(d.stats.transcribed, 2); assert.equal(d.stats.failed, 1); assert.equal(d.stats.rejected, 1);
+  assert.equal(d.stats.byProvider.groq, 2); assert.equal(d.stats.byCode.provider_failed, 1); assert.equal(d.stats.last24h.length, 24);
+  const text = JSON.stringify(d);
+  assert.ok(!text.includes('Hello from the mock') && !text.includes('voice@example.com') && !text.includes(GROQ_KEY), 'no transcript, identity or key in stats');
+
+  assert.equal((await setEnabled('yes')).status, 400);
+  const off = await setEnabled(false); assert.equal(off.status, 200); assert.equal((await off.json()).enabled, false);
+  const blocked = await post(srv, WEBM); assert.equal(blocked.status, 503); assert.equal((await blocked.json()).code, 'disabled');
+  const st = await (await fetch(srv.base + '/api/transcribe', { headers: { Authorization: 'Bearer ' + user } })).json();
+  assert.equal(st.available, false); assert.equal(st.enabled, false);
+  const callsBefore = groq.calls.length; await post(srv, WEBM); assert.equal(groq.calls.length, callsBefore, 'nothing reaches the provider while off');
+  await setEnabled(true); assert.equal((await post(srv, WEBM)).status, 200);
+  const audit = await (await fetch(srv.base + '/api/admin/activity', { headers: { Authorization: 'Bearer ' + admin } })).status;
+  assert.ok(audit === 200 || audit === 503, 'audit read does not crash (storage may be off in tests)');
+  assert.ok(!srv.logText().includes(GROQ_KEY));
+});
+
+test('VOICE_DISABLED=1 starts with voice switched off', async (t) => {
+  const srv = await startServer({ GROQ_API_KEY: GROQ_KEY, VOICE_DISABLED: '1' });
+  t.after(() => srv.child.kill());
+  const r = await post(srv, WEBM); assert.equal(r.status, 503); assert.equal((await r.json()).code, 'disabled');
+});

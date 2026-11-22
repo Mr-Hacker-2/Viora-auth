@@ -83,6 +83,7 @@ function setResearchState(id, owner, step, detail) {
 }
 const limited = (k) => { const n = Date.now(), a = (hits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); hits.set(k, a); return a.length > 40; };
 /* Voice transcription has its own budget so dictation never uses up the chat allowance (20 recordings a minute per account). */
+const voiceLimitText = '20 recordings per minute per account (in-memory)';
 const voiceHits = new Map();
 const voiceLimited = (k) => { const n = Date.now(), a = (voiceHits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); voiceHits.set(k, a); return a.length > 20; };
 const voice = createVoiceService();
@@ -815,6 +816,17 @@ async function handleAdmin(req, res, u) {
       aiProvider: { name: 'NVIDIA NIM', credentialsConfigured: providerConfigured, connection: 'not_tested' },
       adminBootstrap: ADMIN_EMAILS.size ? 'configured' : 'not_configured'
     });
+  }
+  if (req.method === 'GET' && path === '/api/admin/voice') {
+    const st = await voice.status();
+    return json(res, 200, { ...voice.isEnabled(), configured: st.providers, preferred: st.preferred, maxMB: Math.round(st.maxBytes / 1048576 * 10) / 10, rateLimit: voiceLimitText, stats: voice.getStats() });
+  }
+  if (req.method === 'POST' && path === '/api/admin/voice/enabled') {
+    let body; try { body = await readBody(req, 2000); } catch { return json(res, 400, { error: 'Send JSON like {"enabled": true}.' }); }
+    if (typeof body.enabled !== 'boolean') return json(res, 400, { error: 'enabled must be true or false.' });
+    const out = voice.setEnabled(body.enabled, actor);
+    await writeAdminAudit(actor, body.enabled ? 'voice_enabled' : 'voice_disabled', 'voice transcription', 'success');
+    return json(res, 200, out);
   }
   if (req.method === 'GET' && path === '/api/admin/settings') {
     return json(res, 200, {

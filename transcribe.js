@@ -256,6 +256,29 @@ export function createVoiceService({ env = process.env, fetchImpl = fetch, grpc 
   /* GROQ_API_URL / NVIDIA_ASR_URL exist so tests can point at a local stand-in; leave them unset in production. */
   const gUrl = groqUrl || env.GROQ_API_URL || GROQ_URL, nUrl = nvidiaUrl || env.NVIDIA_ASR_URL || NVIDIA_ASR_URL;
   const inflight = new Map(); let total = 0;
+  /* Admin-facing counters. Counts only: no audio, no transcript text, no user identity. They live in memory and reset when the server restarts. */
+  const stats = { since: new Date().toISOString(), requests: 0, ok: 0, empty: 0, failed: 0, rejected: 0, byProvider: { groq: 0, nvidia: 0 }, byCode: {}, audioBytes: 0, totalMs: 0, hourly: new Map() };
+  let enabled = !/^(1|true|yes|on)$/i.test(String(env.VOICE_DISABLED || ''));
+  let disabledBy = enabled ? '' : 'server setting';
+  const hourKey = () => new Date().toISOString().slice(0, 13);
+  function record(kind, { provider = '', code = '', bytes = 0, ms = 0 } = {}) {
+    stats.requests++;
+    if (kind === 'ok') { stats.ok++; if (provider) stats.byProvider[provider] = (stats.byProvider[provider] || 0) + 1; stats.audioBytes += bytes; stats.totalMs += ms; }
+    else if (kind === 'empty') { stats.empty++; if (provider) stats.byProvider[provider] = (stats.byProvider[provider] || 0) + 1; stats.audioBytes += bytes; stats.totalMs += ms; }
+    else if (kind === 'rejected') stats.rejected++; else stats.failed++;
+    if (code) stats.byCode[code] = (stats.byCode[code] || 0) + 1;
+    const h = hourKey(), row = stats.hourly.get(h) || { requests: 0, ok: 0, failed: 0 };
+    row.requests++; if (kind === 'ok' || kind === 'empty') row.ok++; else row.failed++;
+    stats.hourly.set(h, row);
+    for (const k of [...stats.hourly.keys()].sort().slice(0, -48)) stats.hourly.delete(k);
+  }
+  function getStats() {
+    const done = stats.ok + stats.empty;
+    const hours = []; for (let i = 23; i >= 0; i--) { const k = new Date(Date.now() - i * 3600e3).toISOString().slice(0, 13); hours.push({ hour: k + ':00Z', ...(stats.hourly.get(k) || { requests: 0, ok: 0, failed: 0 }) }); }
+    return { since: stats.since, requests: stats.requests, transcribed: stats.ok, noSpeech: stats.empty, failed: stats.failed, rejected: stats.rejected, byProvider: { ...stats.byProvider }, byCode: { ...stats.byCode }, avgSeconds: done ? Math.round(stats.totalMs / done) / 1000 : null, avgAudioKB: done ? Math.round(stats.audioBytes / done / 1024) : null, last24h: hours, storage: 'In memory only. Resets on restart. No audio or transcript text is kept.' };
+  }
+  function setEnabled(on, by = '') { enabled = !!on; disabledBy = enabled ? '' : (by ? 'an administrator' : 'server setting'); return { enabled, disabledBy }; }
+  const isEnabled = () => ({ enabled, disabledBy });
   const preferred = ['groq', 'nvidia'].includes(String(env.VOICE_STT_PROVIDER || '').toLowerCase()) ? String(env.VOICE_STT_PROVIDER).toLowerCase() : 'auto';
 
   async function configured() {
@@ -263,7 +286,7 @@ export function createVoiceService({ env = process.env, fetchImpl = fetch, grpc 
   }
   async function status() {
     const p = await configured();
-    return { available: p.groq || p.nvidia, providers: p, maxBytes, minBytes: MIN_BYTES, preferred };
+    return { available: enabled && (p.groq || p.nvidia), enabled, providers: p, maxBytes, minBytes: MIN_BYTES, preferred };
   }
   function order(choice, p) {
     const want = ['groq', 'nvidia'].includes(choice) ? choice : preferred;
@@ -298,24 +321,28 @@ export function createVoiceService({ env = process.env, fetchImpl = fetch, grpc 
 
   async function handle(req, res, url, { json, user: account }) {
     const user = String(account?.email || account || 'anon');
-    if (!declaredTypeAllowed(req.headers['content-type'])) return json(res, 415, { code: 'unsupported_format', error: 'That audio format is not supported.' });
-    if (total >= maxInflight || (inflight.get(user) || 0) >= maxPerUser) return json(res, 503, { code: 'busy', error: 'Viora is busy transcribing. Try again in a moment.' });
+    if (!enabled) { record('rejected', { code: 'disabled' }); return json(res, 503, { code: 'disabled', error: 'Voice input is switched off right now. Type your message instead.' }); }
+    if (!declaredTypeAllowed(req.headers['content-type'])) { record('rejected', { code: 'unsupported_format' }); return json(res, 415, { code: 'unsupported_format', error: 'That audio format is not supported.' }); }
+    if (total >= maxInflight || (inflight.get(user) || 0) >= maxPerUser) { record('rejected', { code: 'busy' }); return json(res, 503, { code: 'busy', error: 'Viora is busy transcribing. Try again in a moment.' }); }
     total++; inflight.set(user, (inflight.get(user) || 0) + 1);
     try {
       let audio;
       try { audio = await readAudioBody(req, maxBytes); }
       catch (e) {
-        if (e instanceof VoiceError) { res.once('finish', () => req.destroy()); res.setHeader('Connection', 'close'); return json(res, e.status, { code: e.code, error: e.message }); }
+        if (e instanceof VoiceError) { record('rejected', { code: e.code }); res.once('finish', () => req.destroy()); res.setHeader('Connection', 'close'); return json(res, e.status, { code: e.code, error: e.message }); }
         return json(res, 400, { code: 'bad_request', error: 'The upload was interrupted. Try again.' });
       }
       const language = cleanLanguage(url.searchParams.get('language'));
       const provider = String(url.searchParams.get('provider') || 'auto');
+      const t0 = Date.now(), bytes = audio.length;
       const out = await transcribe(audio, { language, provider });
+      record(out.empty ? 'empty' : 'ok', { provider: out.provider, bytes, ms: Date.now() - t0 });
       audio = null; // let the buffer go; nothing keeps a reference
       res.setHeader('Cache-Control', 'no-store');
       return json(res, 200, { text: out.text, empty: out.empty, language: out.language, duration: out.duration, provider: out.provider });
     } catch (e) {
-      if (e instanceof VoiceError) return json(res, e.status, { code: e.code, error: e.message });
+      if (e instanceof VoiceError) { record(e.status >= 500 && e.code !== 'not_configured' ? 'failed' : 'rejected', { code: e.code }); return json(res, e.status, { code: e.code, error: e.message }); }
+      record('failed', { code: 'server_error' });
       console.error('Voice request failed:', e?.name || 'error');
       return json(res, 500, { code: 'server_error', error: 'Voice transcription failed. Try again.' });
     } finally {
@@ -323,5 +350,5 @@ export function createVoiceService({ env = process.env, fetchImpl = fetch, grpc 
     }
   }
 
-  return { status, transcribe, handle, maxBytes };
+  return { status, transcribe, handle, maxBytes, getStats, setEnabled, isEnabled };
 }

@@ -11,6 +11,7 @@ Voice (speech-to-text for the web app's microphone and Voice Mode):
 - `NVIDIA_API_KEY`: already used for chat. If **ffmpeg is installed on the server** it is also used as the fallback transcription provider (see below)
 - `VOICE_STT_PROVIDER`: optional, `auto` (default: Groq, then NVIDIA), `groq` or `nvidia` (try that one first)
 - `VOICE_MAX_BYTES`: optional upload limit, default 10 MB, never above 25 MB (Groq's free-tier file limit)
+- `VOICE_DISABLED`: set to `1` to start with voice input switched off. Admins can also flip it live from the Voice page of the admin dashboard (`/api/admin/voice`, `/api/admin/voice/enabled`; resets on restart). The page shows in-memory counts only, never audio or transcript text.
 - `NVIDIA_WHISPER_FUNCTION_ID`: optional override; default is the id listed on build.nvidia.com/openai/whisper-large-v3
 
 Backblaze B2 (S3-compatible API, no extra packages):
