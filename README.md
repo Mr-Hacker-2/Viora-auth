@@ -6,6 +6,14 @@ Existing: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `TOKEN_SECRET`, `SITE_URL`
 
 Set `HUMANIZER_MODELS` to a comma-separated list of NVIDIA NIM model IDs to choose the Humanizer fallback priority, for example `moonshotai/kimi-k3,deepseek-ai/deepseek-v4.1-flash,z-ai/glm-5.3`. Leave it unset to use that default order.
 
+Voice (speech-to-text for the web app's microphone and Voice Mode):
+- `GROQ_API_KEY`: Groq key. Primary provider, model `whisper-large-v3`. Set it as a Render environment variable only; never put it in the website or in Git
+- `NVIDIA_API_KEY`: already used for chat. If **ffmpeg is installed on the server** it is also used as the fallback transcription provider (see below)
+- `VOICE_STT_PROVIDER`: optional, `auto` (default: Groq, then NVIDIA), `groq` or `nvidia` (try that one first)
+- `VOICE_MAX_BYTES`: optional upload limit, default 10 MB, never above 25 MB (Groq's free-tier file limit)
+- `VOICE_DISABLED`: set to `1` to start with voice input switched off. Admins can also flip it live from the Voice page of the admin dashboard (`/api/admin/voice`, `/api/admin/voice/enabled`; resets on restart). The page shows in-memory counts only, never audio or transcript text.
+- `NVIDIA_WHISPER_FUNCTION_ID`: optional override; default is the id listed on build.nvidia.com/openai/whisper-large-v3
+
 Backblaze B2 (S3-compatible API, no extra packages):
 - `B2_KEY_ID`: application key ID (Backblaze → App Keys)
 - `B2_APP_KEY`: the key secret. Limit the key to the one bucket, with read and write access
@@ -24,6 +32,7 @@ and the answers to the 5 sign-up questions (`profile.js`). Only the fixed option
 - `GET /api/profile` → `{ questions, onboarded, answers }` (Bearer token)
 - `POST /api/profile` with `{ answers }` → validates and saves the answers (Bearer token)
 - `/api/chat` adds the saved answers to the AI's system prompt as background about the user
+- `POST /api/transcribe` with the raw recording as the body (`Content-Type: audio/webm`, `audio/mp4`, `audio/ogg`, `audio/wav`, `audio/flac`, `audio/mpeg`) and an optional `?language=en` → `{ text, empty, language, duration, provider }` (Bearer token). `GET /api/transcribe` → `{ available, providers: {groq, nvidia}, maxBytes }` (booleans only, never keys)
 - `GET /api/progress?id=<request-id>` → short-lived research status for the authenticated owner of a chat request (Bearer token); no token is placed in the URL
 
 ## Pro Search
@@ -53,3 +62,12 @@ The static website includes a protected `/admin/` control center. It does not tr
 Admin account search, role changes, suspension/reactivation, current-process request counts, model configuration, health checks, and audit events require Backblaze B2 to be configured. Role/status changes are confirmed in the UI and audit logged. Bootstrap emails cannot be changed in the UI. A suspended account is denied on subsequent authenticated requests; the server's short account-status cache may take up to 10 seconds to refresh.
 
 The dashboard reports conversation totals, uploaded-file totals, provider connectivity, billing cost, historical request charts, and runtime feature toggles as unavailable because the current services do not provide those data or controls. Provider-key indicators show only whether a server key is configured and never return the secret.
+
+## Voice transcription (`transcribe.js`)
+
+Audio is handled in memory for one request: it is never written to disk, never logged and never stored. Before any audio goes to a provider the server checks the size (413), that it is long enough to hold speech (400), the declared content type (415) and the real container from the file's magic bytes (415), then applies a per-account limit of 20 recordings a minute (429) and at most 2 transcriptions at once per account (503). A recording the model itself marks as non-speech comes back as `empty: true` instead of an invented sentence.
+
+**Groq** (primary): `POST https://api.groq.com/openai/v1/audio/transcriptions`, multipart form, `model=whisper-large-v3`, `Authorization: Bearer $GROQ_API_KEY`. Accepts webm, mp4/m4a, ogg, wav, flac and mp3 directly.
+
+**NVIDIA** (fallback) is *not* the same request format. The hosted `whisper-large-v3` is a Riva **gRPC** service: `grpc.nvcf.nvidia.com:443`, method `/nvidia.riva.asr.RivaSpeechRecognition/Recognize`, metadata `function-id` and `authorization: Bearer $NVIDIA_API_KEY`, a protobuf `RecognizeRequest`, and audio that must be mono 16-bit WAV, OPUS or FLAC. Browser recordings are webm or mp4, so the server converts them to mono 16 kHz FLAC with `ffmpeg` (stdin to stdout, nothing on disk). The protobuf and gRPC framing are written against `node:http2`, so the server still has no dependencies. Render's Node runtime does not include ffmpeg by default: without it the NVIDIA fallback reports itself unavailable and Groq alone is used.
+
