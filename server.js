@@ -1603,12 +1603,14 @@ http.createServer(async (req, res) => {
       if (speakLimited(user.email)) return json(res, 429, { code: 'rate_limited', error: 'Slow down a little, then try again.' });
       let body;
       try { body = await readBody(req, 4000); } catch { return json(res, 400, { code: 'bad_request', error: 'That request could not be read.' }); }
+      const gone = new AbortController(); // the browser hung up (interrupted, stopped, left the page): stop working for it
+      res.once('close', () => { if (!res.writableEnded) gone.abort(); });
       try {
-        const out = await speech.synthesize({ text: body?.text, voice: body?.voice, user: user.email });
+        const out = await speech.synthesize({ text: body?.text, voice: body?.voice, user: user.email, signal: gone.signal });
         res.writeHead(200, { 'Content-Type': out.contentType, 'Content-Length': String(out.audio.length), 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...cors() });
         return res.end(out.audio);
       } catch (e) {
-        if (e instanceof SpeechError) return json(res, e.status, { code: e.code, error: e.message });
+        if (e instanceof SpeechError) return res.writableEnded || res.destroyed ? undefined : json(res, e.status, { code: e.code, error: e.message });
         console.error('Speech request failed:', e?.name || 'error');
         return json(res, 500, { code: 'server_error', error: 'Speech failed. Try again.' });
       }

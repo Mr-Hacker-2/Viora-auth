@@ -30,7 +30,7 @@ export function cleanSpeechText(text) {
 }
 export const pickVoice = v => TTS_VOICES.includes(String(v || '').toLowerCase()) ? String(v).toLowerCase() : TTS_DEFAULT_VOICE;
 
-export function createSpeechService({ env = process.env, fetchImpl = fetch, maxInflight = 8, maxPerUser = 3, timeoutMs = 30000 } = {}) {
+export function createSpeechService({ env = process.env, fetchImpl = fetch, maxInflight = 16, maxPerUser = 5, timeoutMs = 30000 } = {}) {
   const url = env.GROQ_TTS_URL || GROQ_TTS_URL; // the override exists so tests can use a local stand-in; leave it unset in production
   const model = env.GROQ_TTS_MODEL || TTS_MODEL;
   let enabled = !/^(1|true|yes|on)$/i.test(String(env.SPEECH_DISABLED || ''));
@@ -42,15 +42,18 @@ export function createSpeechService({ env = process.env, fetchImpl = fetch, maxI
   const count = (kind, code = '') => { stats.requests++; stats[kind]++; if (code) stats.byCode[code] = (stats.byCode[code] || 0) + 1; };
 
   /* Returns { audio: Buffer, contentType, voice }. Throws SpeechError with a message that is safe to show. */
-  async function synthesize({ text, voice, user = 'anon' } = {}) {
+  async function synthesize({ text, voice, user = 'anon', signal } = {}) {
     if (!enabled) throw new SpeechError(503, 'disabled', 'Spoken replies are switched off right now.');
     if (!env.GROQ_API_KEY) throw new SpeechError(503, 'not_configured', 'Spoken replies are not set up on the server yet.');
     const input = cleanSpeechText(text);
     if (!/[\p{L}\p{N}]/u.test(input)) throw new SpeechError(400, 'empty', 'There was nothing to say.');
     if (input.length > TTS_MAX_CHARS) throw new SpeechError(400, 'too_long', 'That piece is too long to speak at once (' + TTS_MAX_CHARS + ' characters at most).');
+    if (signal?.aborted) throw new SpeechError(499, 'cancelled', 'Cancelled.');
     if (total >= maxInflight || (inflight.get(user) || 0) >= maxPerUser) throw new SpeechError(503, 'busy', 'Viora is busy speaking. Try again in a moment.');
     total++; inflight.set(user, (inflight.get(user) || 0) + 1);
     const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), timeoutMs);
+    const onCallerAbort = () => ctl.abort(); // the person interrupted or left: stop the request to Groq so the slot is freed at once
+    if (signal) { if (signal.aborted) ctl.abort(); else signal.addEventListener('abort', onCallerAbort, { once: true }); }
     try {
       let r;
       try {
@@ -60,6 +63,7 @@ export function createSpeechService({ env = process.env, fetchImpl = fetch, maxI
           body: JSON.stringify({ model, input, voice: pickVoice(voice), response_format: 'wav' })
         });
       } catch (e) {
+        if (signal?.aborted) throw new SpeechError(499, 'cancelled', 'Cancelled.');
         if (e?.name === 'AbortError') throw new SpeechError(504, 'timeout', 'Speech took too long to generate.');
         throw new SpeechError(502, 'provider_failed', 'Speech is unavailable right now.');
       }
@@ -72,15 +76,16 @@ export function createSpeechService({ env = process.env, fetchImpl = fetch, maxI
         throw new SpeechError(502, 'provider_failed', 'Speech is unavailable right now.');
       }
       const audio = Buffer.from(await r.arrayBuffer());
+      if (signal?.aborted) throw new SpeechError(499, 'cancelled', 'Cancelled.');
       if (audio.length < 64) throw new SpeechError(502, 'provider_failed', 'Speech came back empty.');
       if (audio.length > TTS_MAX_AUDIO_BYTES) throw new SpeechError(502, 'provider_failed', 'Speech came back too large.');
       stats.chars += input.length; count('ok');
       return { audio, contentType: 'audio/wav', voice: pickVoice(voice) };
     } catch (e) {
-      if (e instanceof SpeechError) count(e.status >= 500 && e.code !== 'not_configured' ? 'failed' : 'rejected', e.code); else count('failed', 'server_error');
+      if (e instanceof SpeechError) count(e.status >= 500 && e.code !== 'not_configured' ? 'failed' : 'rejected', e.code); // a cancelled request counts as rejected, not failed else count('failed', 'server_error');
       throw e;
     } finally {
-      clearTimeout(timer); total--; const n = (inflight.get(user) || 1) - 1; n ? inflight.set(user, n) : inflight.delete(user);
+      clearTimeout(timer); signal?.removeEventListener?.('abort', onCallerAbort); total--; const n = (inflight.get(user) || 1) - 1; n ? inflight.set(user, n) : inflight.delete(user);
     }
   }
 

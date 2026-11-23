@@ -135,3 +135,48 @@ test('/api/speak without a key reports unavailable', async () => {
     assert.equal(r.status, 503); assert.equal((await r.json()).code, 'not_configured');
   } finally { srv.child.kill(); }
 });
+
+/* ---------- review additions: cancel propagation, preflight, rate limit ---------- */
+test('a caller abort cancels the request to Groq and frees the slot', async () => {
+  const seen = [];
+  const s = createSpeechService({ env: { GROQ_API_KEY: KEY }, maxPerUser: 1, fetchImpl: (url, init) => new Promise((_, no) => { seen.push(init.signal); init.signal.addEventListener('abort', () => no(Object.assign(new Error('a'), { name: 'AbortError' }))); }) });
+  const ctl = new AbortController();
+  const p = s.synthesize({ text: 'hello there friend', user: 'u@x.com', signal: ctl.signal });
+  await new Promise(r => setTimeout(r, 10)); ctl.abort();
+  await assert.rejects(p, e => e.code === 'cancelled' && e.status === 499);
+  assert.ok(seen[0].aborted, 'the upstream request was aborted');
+  const s2 = createSpeechService({ env: { GROQ_API_KEY: KEY }, maxPerUser: 1, fetchImpl: async () => okWav() });
+  assert.ok((await s2.synthesize({ text: 'free again', user: 'u@x.com' })).audio.length > 0);
+  const pre = new AbortController(); pre.abort();
+  await assert.rejects(s.synthesize({ text: 'already gone', user: 'v@x.com', signal: pre.signal }), e => e.code === 'cancelled', 'an already-aborted signal never starts a request');
+});
+
+test('through the real server: hanging up stops the Groq request, the preflight answers, and the limiter returns 429', async () => {
+  const state = { hang: true, upstreamClosed: 0, status: 200 };
+  const upstream = http.createServer((req, res) => { req.resume(); res.on('close', () => { if (!res.writableEnded) state.upstreamClosed++; }); if (!state.hang) { res.writeHead(200, { 'Content-Type': 'audio/wav' }); res.end(WAV); } });
+  await new Promise(ok => upstream.listen(0, '127.0.0.1', ok));
+  const srv = await startServer({ GROQ_API_KEY: KEY, GROQ_TTS_URL: 'http://127.0.0.1:' + upstream.address().port + '/openai/v1/audio/speech' });
+  const H = { Authorization: 'Bearer ' + makeToken('limit@example.com'), 'Content-Type': 'application/json' };
+  try {
+    // preflight, as a browser on the site's origin sends it
+    const pre = await fetch(srv.base + '/api/speak', { method: 'OPTIONS', headers: { Origin: 'http://127.0.0.1', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' } });
+    assert.equal(pre.status, 204);
+    assert.equal(pre.headers.get('access-control-allow-origin'), 'http://127.0.0.1', 'only the configured site origin is allowed, not *');
+    assert.match(pre.headers.get('access-control-allow-headers'), /Authorization/i);
+    assert.match(pre.headers.get('access-control-allow-methods'), /POST/);
+    // hang up mid-request
+    const ctl = new AbortController();
+    const pending = fetch(srv.base + '/api/speak', { method: 'POST', headers: H, body: JSON.stringify({ text: 'This request will be abandoned.' }), signal: ctl.signal }).catch(() => 'aborted');
+    await new Promise(r => setTimeout(r, 250)); ctl.abort(); assert.equal(await pending, 'aborted');
+    for (let i = 0; i < 40 && !state.upstreamClosed; i++) await new Promise(r => setTimeout(r, 50));
+    assert.equal(state.upstreamClosed, 1, 'the request to Groq was cancelled when the browser hung up');
+    // more than 120 requests in a minute from one account are limited (cheap rejected requests are enough to count)
+    let limited = 0;
+    for (let i = 0; i < 125; i++) { const r = await fetch(srv.base + '/api/speak', { method: 'POST', headers: H, body: JSON.stringify({ text: '' }) }); if (r.status === 429) { limited++; assert.equal((await r.json()).code, 'rate_limited'); } else await r.arrayBuffer(); }
+    assert.equal(limited, 6, 'the abandoned request plus 125 more is 126 in a minute: requests 121 to 126 are limited');
+    // another account is not affected
+    state.hang = false;
+    const other = await fetch(srv.base + '/api/speak', { method: 'POST', headers: { ...H, Authorization: 'Bearer ' + makeToken('someone-else@example.com') }, body: JSON.stringify({ text: 'Different person.' }) });
+    assert.equal(other.status, 200);
+  } finally { srv.child.kill(); upstream.close(); }
+});

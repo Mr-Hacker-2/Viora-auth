@@ -11,6 +11,7 @@ Voice (speech-to-text for the web app's microphone and Voice Mode):
 - `NVIDIA_API_KEY`: already used for chat. If **ffmpeg is installed on the server** it is also used as the fallback transcription provider (see below)
 - `VOICE_STT_PROVIDER`: optional, `auto` (default: Groq, then NVIDIA), `groq` or `nvidia` (try that one first)
 - `VOICE_MAX_BYTES`: optional upload limit, default 10 MB, never above 25 MB (Groq's free-tier file limit)
+- Spoken replies (text-to-speech) use the **same** `GROQ_API_KEY`; there is nothing new to set. Model `canopylabs/orpheus-v1-english` (override with `GROQ_TTS_MODEL`). Groq may require the model's terms to be accepted once in the Groq console; until then `/api/speak` answers `terms_required` and the website shows that message. `SPEECH_DISABLED=1` switches spoken replies off.
 - `VOICE_DISABLED`: set to `1` to start with voice input switched off. Admins can also flip it live from the Voice page of the admin dashboard (`/api/admin/voice`, `/api/admin/voice/enabled`; resets on restart). The page shows in-memory counts only, never audio or transcript text.
 - `NVIDIA_WHISPER_FUNCTION_ID`: optional override; default is the id listed on build.nvidia.com/openai/whisper-large-v3
 
@@ -33,6 +34,7 @@ and the answers to the 5 sign-up questions (`profile.js`). Only the fixed option
 - `POST /api/profile` with `{ answers }` → validates and saves the answers (Bearer token)
 - `/api/chat` adds the saved answers to the AI's system prompt as background about the user
 - `POST /api/transcribe` with the raw recording as the body (`Content-Type: audio/webm`, `audio/mp4`, `audio/ogg`, `audio/wav`, `audio/flac`, `audio/mpeg`) and an optional `?language=en` → `{ text, empty, language, duration, provider }` (Bearer token). `GET /api/transcribe` → `{ available, providers: {groq, nvidia}, maxBytes }` (booleans only, never keys)
+- `POST /api/speak` with `{ "text": "up to 200 characters", "voice": "hannah" }` → `audio/wav` (Bearer token). Voices: `hannah` (default), `autumn`, `diana`, `austin`, `daniel`, `troy`. Square brackets are stripped (Orpheus reads `[word]` as a vocal direction). Limits: 120 requests per minute per account, 5 in flight per account. If the browser hangs up, the request to Groq is cancelled. `GET /api/speak` → `{ available, model, voices, defaultVoice, maxChars }` (never a key). Errors are JSON `{ code, error }`.
 - `GET /api/progress?id=<request-id>` → short-lived research status for the authenticated owner of a chat request (Bearer token); no token is placed in the URL
 
 ## Pro Search
