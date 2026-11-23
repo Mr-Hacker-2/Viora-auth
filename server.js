@@ -8,6 +8,7 @@ import { buildResearchContext, searchWeb } from './web-search.js';
 import { createSseCompletionTracker, peekForContent, replayStream } from './stream-completion.js';
 import { MAX_HUMANIZE_CHARS, MAX_HUMANIZE_WORDS, extractHumanizeDraft, humanizeWordCount, validateHumanizeOutput } from './humanize-control.js';
 import { createVoiceService } from './transcribe.js';
+import { createSpeechService, SpeechError } from './speech.js';
 import { systemFor, heuristicIntent, modelIntent, modelResearchDecision, taskGuide, qualityNotes, EDIT_TASKS } from './intelligence.js';
 import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, createReasoningStripper, stripReasoningFromEvent } from './think.js';
 import { accountFlowDecision } from './auth-flow.js';
@@ -91,6 +92,10 @@ const voiceLimitText = '20 recordings per minute per account (in-memory)';
 const voiceHits = new Map();
 const voiceLimited = (k) => { const n = Date.now(), a = (voiceHits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); voiceHits.set(k, a); return a.length > 20; };
 const voice = createVoiceService();
+/* Spoken replies: one reply is cut into short pieces and each piece is one request, so this budget is larger than the recording one (120 a minute per account). */
+const speech = createSpeechService();
+const speakHits = new Map();
+const speakLimited = (k) => { const n = Date.now(), a = (speakHits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); speakHits.set(k, a); return a.length > 120; };
 const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Vary': 'Origin' });
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', ...cors() }); res.end(JSON.stringify(obj)); };
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
@@ -1589,6 +1594,24 @@ http.createServer(async (req, res) => {
       if (req.method !== 'POST') return json(res, 405, { error: 'Use POST with the recorded audio.' });
       if (voiceLimited(user.email)) return json(res, 429, { code: 'rate_limited', error: 'Slow down a little, then try again.' });
       return await voice.handle(req, res, u, { json, user });
+    }
+    if (u.pathname === '/api/speak') {
+      const user = await userOf(req);
+      if (!user) return json(res, 401, { error: 'Please sign in again.' });
+      if (req.method === 'GET') return json(res, 200, speech.status());
+      if (req.method !== 'POST') return json(res, 405, { error: 'Use POST with the text to speak.' });
+      if (speakLimited(user.email)) return json(res, 429, { code: 'rate_limited', error: 'Slow down a little, then try again.' });
+      let body;
+      try { body = await readBody(req, 4000); } catch { return json(res, 400, { code: 'bad_request', error: 'That request could not be read.' }); }
+      try {
+        const out = await speech.synthesize({ text: body?.text, voice: body?.voice, user: user.email });
+        res.writeHead(200, { 'Content-Type': out.contentType, 'Content-Length': String(out.audio.length), 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...cors() });
+        return res.end(out.audio);
+      } catch (e) {
+        if (e instanceof SpeechError) return json(res, e.status, { code: e.code, error: e.message });
+        console.error('Speech request failed:', e?.name || 'error');
+        return json(res, 500, { code: 'server_error', error: 'Speech failed. Try again.' });
+      }
     }
     if (u.pathname === '/api/chat' || u.pathname === '/api/read') {
       const user = await userOf(req);
