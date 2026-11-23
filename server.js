@@ -19,6 +19,10 @@ const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
 const ALLOWED_EXT = (process.env.ALLOWED_EXT || 'kkcljeingbbpgbilahlaganmmgggbkik').split(',');
 const SITE = (process.env.SITE_URL || "").replace(/\/$/, "");
 const ADMIN_EMAILS = new Set(String(process.env.ADMIN_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+const CREDITS_ENFORCED = /^(1|true|yes|on)$/i.test(String(process.env.CREDITS_ENFORCED || ''));
+/** Premium is a stored flag with an optional end date. Credits are an optional per-account allowance: an account with no credits field has no limit. */
+const premiumActive = rec => rec?.premium?.active === true && (!rec.premium.until || Date.parse(rec.premium.until) > Date.now());
+const planOf = rec => ({ premium: premiumActive(rec), premiumUntil: premiumActive(rec) ? rec.premium.until || null : null, credits: Number.isFinite(rec?.credits) ? rec.credits : null });
 const ADMIN_ACCESS_PASSWORD = process.env.ADMIN_ACCESS_PASSWORD || '';
 const adminLoginAttempts = new Map();
 const normEmail = value => String(value || '').trim().toLowerCase();
@@ -719,6 +723,7 @@ async function handleAdmin(req, res, u) {
         roleManagedBy: ADMIN_EMAILS.has(normEmail(row.email)) ? 'server environment' : 'admin',
         provider: row.provider === 'password' ? 'password' : 'google', emailVerified: row.provider === 'password' ? row.emailVerified === true : true,
         status: row.status === 'suspended' ? 'suspended' : 'active',
+        premium: premiumActive(row), premiumUntil: premiumActive(row) ? row.premium.until || null : null, credits: Number.isFinite(row.credits) ? row.credits : null,
         lastIp: String(row.lastIp || '').slice(0, 45), lastSeenAt: row.lastSeenAt || null,
         ips: Array.isArray(row.ips) ? row.ips.slice(0, 10).map(e => ({ ip: String((e && e.ip) || '').slice(0, 45), firstAt: (e && e.firstAt) || null, lastAt: (e && e.lastAt) || null })) : [],
         location: adminLocation(row)
@@ -780,6 +785,47 @@ async function handleAdmin(req, res, u) {
     } catch {
       await writeAdminAudit(actor, 'user_status_changed', email, 'failed', { to: status });
       return json(res, 503, { error: 'The account status could not be saved.' });
+    }
+  }
+  if (req.method === 'POST' && path === '/api/admin/users/premium') {
+    let body; try { body = await readBody(req, 2000); } catch { return json(res, 400, { error: 'Invalid request body.' }); }
+    const email = normEmail(body.email), on = body.premium;
+    const days = body.days == null ? null : Number(body.days);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || typeof on !== 'boolean') return json(res, 400, { error: 'A valid email and premium true/false are required.' });
+    if (days != null && (!Number.isInteger(days) || days < 1 || days > 3650)) return json(res, 400, { error: 'Days must be a whole number from 1 to 3650, or left empty for no end date.' });
+    if (!b2Ready()) return json(res, 503, { error: 'Account storage is not configured.' });
+    try {
+      const key = userKey(email), record = await getJson(key);
+      if (!record) return json(res, 404, { error: 'User account was not found.' });
+      const before = planOf(record);
+      record.premium = on ? { active: true, until: days ? new Date(Date.now() + days * 864e5).toISOString() : null, grantedBy: actor, at: new Date().toISOString() } : { active: false, revokedBy: actor, at: new Date().toISOString() };
+      await putJson(key, record);
+      await writeAdminAudit(actor, on ? 'premium_granted' : 'premium_revoked', email, 'success', { was: before.premium, until: record.premium.until || null });
+      return json(res, 200, { ok: true, email, ...planOf(record) });
+    } catch {
+      await writeAdminAudit(actor, 'premium_changed', email, 'failed', { to: on });
+      return json(res, 503, { error: 'The premium change could not be saved.' });
+    }
+  }
+  if (req.method === 'POST' && path === '/api/admin/users/credits') {
+    let body; try { body = await readBody(req, 2000); } catch { return json(res, 400, { error: 'Invalid request body.' }); }
+    const email = normEmail(body.email);
+    const hasSet = body.set !== undefined && body.set !== null, hasDelta = body.delta !== undefined && body.delta !== null;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || hasSet === hasDelta) return json(res, 400, { error: 'Send a valid email and exactly one of "set" or "delta".' });
+    const n = Number(hasSet ? body.set : body.delta);
+    if (!Number.isInteger(n) || Math.abs(n) > 1e6 || (hasSet && n < 0)) return json(res, 400, { error: 'Credits must be a whole number (set: 0 to 1,000,000; delta: within ±1,000,000).' });
+    if (!b2Ready()) return json(res, 503, { error: 'Account storage is not configured.' });
+    try {
+      const key = userKey(email), record = await getJson(key);
+      if (!record) return json(res, 404, { error: 'User account was not found.' });
+      const before = Number.isFinite(record.credits) ? record.credits : null;
+      record.credits = hasSet ? n : Math.max(0, (before ?? 0) + n);
+      await putJson(key, record);
+      await writeAdminAudit(actor, 'credits_changed', email, 'success', { from: before, to: record.credits });
+      return json(res, 200, { ok: true, email, ...planOf(record) });
+    } catch {
+      await writeAdminAudit(actor, 'credits_changed', email, 'failed', {});
+      return json(res, 503, { error: 'The credit change could not be saved.' });
     }
   }
   if (req.method === 'GET' && path === '/api/admin/activity') {
@@ -1044,6 +1090,17 @@ async function chat(req, res, user) {
   const b = await readBody(req, 16e6), a = ASSIST[b.assistant];
   if (!a || !Array.isArray(b.messages) || !b.messages.length) return json(res, 400, { error: 'Bad request.' });
   const dupKey = user.email + '|' + b.assistant + (b.think === true ? '|think|' : '|') + crypto.createHash('sha1').update(JSON.stringify(b.messages.slice(-3).map(m => [m && m.role, String(m && m.content || '').slice(0, 2000)]))).digest('hex');
+  /* Credits (only when CREDITS_ENFORCED is on): an account with a credit balance spends one per answer. Premium accounts, administrators and
+     accounts with no balance are never limited. Short internal calls such as chat titles are free. */
+  if (CREDITS_ENFORCED && b2Ready() && !ADMIN_EMAILS.has(user.email) && !(Number.isInteger(b.max_tokens) && b.max_tokens <= 64)) {
+    try {
+      const key = userKey(user.email), record = await getJson(key);
+      if (record && record.role !== 'admin' && !premiumActive(record) && Number.isFinite(record.credits)) {
+        if (record.credits <= 0) return json(res, 402, { code: 'out_of_credits', error: 'You are out of credits. Ask the site owner for more, or upgrade to premium.' });
+        record.credits -= 1; await putJson(key, record);
+      }
+    } catch { /* storage hiccup: never block a chat because the balance could not be read */ }
+  }
   const dupStarted = inflightChats.get(dupKey);
   if (dupStarted && Date.now() - dupStarted.at < 4000) return json(res, 409, { error: 'This message is already being answered.' });
   const dupEntry = { at: Date.now() };
@@ -1618,6 +1675,13 @@ http.createServer(async (req, res) => {
     }
 
     // The sign-up questions and this user's saved answers (stored in Backblaze B2).
+    if (req.method === 'GET' && u.pathname === '/api/account/plan') {
+      const user = await userOf(req);
+      if (!user) return json(res, 401, { error: 'Please sign in again.' });
+      if (!b2Ready()) return json(res, 200, { premium: false, premiumUntil: null, credits: null, enforced: false });
+      try { return json(res, 200, { ...planOf(await getJson(userKey(user.email))), enforced: CREDITS_ENFORCED }); }
+      catch { return json(res, 503, { error: 'Your plan could not be read right now.' }); }
+    }
     if (u.pathname === '/api/profile') {
       const user = await userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
