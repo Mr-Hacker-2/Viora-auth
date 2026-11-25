@@ -15,6 +15,7 @@ import { accountFlowDecision } from './auth-flow.js';
 import { clientIp, seenUpdate, cleanLocation, locationPrompt, adminLocation, NO_LOCATION_PROMPT } from './visitor.js';
 import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
 import { handleLabsAdmin, handleLabsPublic } from './labs-cms.js';
+import { handleLabsAdmin, handleLabsPublic } from './labs-cms.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
 const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
@@ -683,6 +684,8 @@ async function handleAdmin(req, res, u) {
   const actor = auth.user.email;
   if (limited('admin:' + actor)) return json(res, 429, { error: 'Slow down a little, then try again.' });
   const path = u.pathname;
+  const labsHandled = await handleLabsAdmin(req, res, u, actor, { b2Ready, getJson, putJson, getObject, putObject, readBody, audit: writeAdminAudit, cors, json: (response, code, data) => { json(response, code, data); return true; } });
+  if (labsHandled) return;
   const labsHandled = await handleLabsAdmin(req, res, u, actor, { b2Ready, getJson, putJson, getObject, putObject, readBody, audit: writeAdminAudit, cors, json: (response, code, data) => { json(response, code, data); return true; } });
   if (labsHandled) return;
   if (req.method === 'GET' && path === '/api/admin/session') {
@@ -1584,6 +1587,7 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, BASE);
   try {
     if (req.method === 'OPTIONS') { res.writeHead(204, cors()); return res.end(); }
+    if (u.pathname.startsWith('/api/labs/')) return await handleLabsPublic(req, res, u, { b2Ready, getJson, getObject, cors, json });
     if (u.pathname.startsWith('/api/labs/')) return await handleLabsPublic(req, res, u, { b2Ready, getJson, getObject, cors, json });
     if (u.pathname.startsWith('/api/planner/')) return await handlePlanner(req, res, u);
     if (req.method === 'POST' && u.pathname === '/api/admin/login') return await handleAdminPasswordLogin(req, res);
