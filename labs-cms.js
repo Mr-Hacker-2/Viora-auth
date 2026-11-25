@@ -70,11 +70,18 @@ function cleanArticle(raw, existing = null) {
   const coverImageId = text(raw.coverImageId, 64);
   if (coverImageId && !/^[a-f0-9-]{36}\.(?:png|jpg|webp|gif)$/.test(coverImageId)) throw new Error('Cover image reference is invalid.');
   const status = raw.status === 'published' ? 'published' : 'draft';
+  let requested = null;
+  if (raw.publishedAt) {
+    const d = new Date(String(raw.publishedAt));
+    if (Number.isNaN(d.getTime()) || d.getFullYear() < 2000 || d.getFullYear() > 2100) throw new Error('Publication date is invalid.');
+    requested = d.toISOString();
+  }
   return { id, title, subtitle, coverImageId, blocks, author: text(raw.author || 'Viora Team', 80),
     category: text(raw.category || 'Technology', 60), tags: Array.isArray(raw.tags) ? [...new Set(raw.tags.slice(0, 12).map(x => text(x, 32)).filter(Boolean))] : [],
     status, featured: raw.featured === true, createdAt: existing?.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(), publishedAt: status === 'published' ? (existing?.publishedAt || new Date().toISOString()) : null };
+    updatedAt: new Date().toISOString(), publishedAt: status === 'published' ? (requested || existing?.publishedAt || new Date().toISOString()) : (requested || existing?.publishedAt || null) };
 }
+const isLive = a => a.status === 'published' && (!a.publishedAt || Date.parse(a.publishedAt) <= Date.now());
 async function readTools(deps) {
   const stored = await deps.getJson(TOOLS_KEY);
   return Array.isArray(stored?.tools) ? stored.tools : defaultLabsTools();
@@ -86,19 +93,19 @@ async function readArticles(deps) {
 async function referenced(id, publicOnly, deps) {
   const [tools, articles] = await Promise.all([readTools(deps), readArticles(deps)]);
   return tools.some(t => (!publicOnly || t.active !== false) && t.imageId === id) ||
-    articles.some(a => (!publicOnly || a.status === 'published') &&
+    articles.some(a => (!publicOnly || isLive(a)) &&
       (a.coverImageId === id || (a.blocks || []).some(b => b.type === 'image' && b.imageId === id)));
 }
 async function sendImage(res, id, publicOnly, deps) {
   if (!/^[a-f0-9-]{36}\.(?:png|jpg|webp|gif)$/.test(id)) return deps.json(res, 404, { error: 'Image not found.' });
   if (!deps.b2Ready()) return deps.json(res, 503, { error: 'Image storage is unavailable.' });
   try {
-    if (!(await referenced(id, publicOnly, deps))) return deps.json(res, 404, { error: 'Image not found.' });
+    if (publicOnly && !(await referenced(id, true, deps))) return deps.json(res, 404, { error: 'Image not found.' });
     const object = await deps.getObject('labs/media/' + id);
     if (!object) return deps.json(res, 404, { error: 'Image not found.' });
     const bytes = Buffer.from(await object.arrayBuffer());
     const ext = id.split('.').pop(), mime = ({ png:'image/png', jpg:'image/jpeg', webp:'image/webp', gif:'image/gif' })[ext];
-    res.writeHead(200, { 'Content-Type': mime, 'Content-Length': bytes.length, 'Cache-Control': 'public, max-age=3600', 'X-Content-Type-Options': 'nosniff', ...deps.cors() });
+    res.writeHead(200, { 'Content-Type': mime, 'Content-Length': bytes.length, 'Cache-Control': publicOnly ? 'public, max-age=300' : 'private, no-store', 'X-Content-Type-Options': 'nosniff', ...deps.cors() });
     return res.end(bytes);
   } catch { return deps.json(res, 503, { error: 'Image could not be loaded.' }); }
 }
@@ -110,7 +117,7 @@ export async function handleLabsPublic(req, res, u, deps) {
     try {
       const [tools, articles] = await Promise.all([readTools(deps), readArticles(deps)]);
       return deps.json(res, 200, { tools: tools.filter(t => t.active !== false).sort((a,b) => a.order-b.order),
-        articles: articles.filter(a => a.status === 'published').sort((a,b) => String(b.publishedAt || '').localeCompare(String(a.publishedAt || ''))) });
+        articles: articles.filter(a => isLive(a)).sort((a,b) => String(b.publishedAt || '').localeCompare(String(a.publishedAt || ''))) });
     } catch { return deps.json(res, 503, { error: 'Published Labs content is temporarily unavailable.' }); }
   }
   if (u.pathname.startsWith('/api/labs/media/')) return sendImage(res, decodeURIComponent(u.pathname.slice('/api/labs/media/'.length)), true, deps);
@@ -145,6 +152,7 @@ export async function handleLabsAdmin(req, res, u, actor, deps) {
     if (!deps.b2Ready()) return deps.json(res, 503, { error: 'Labs publishing storage is not configured.' });
     try {
       const articles = await readArticles(deps), existing = articles.find(a => a.id === slug(body.id || body.title));
+      if (body.isNew === true && existing) return deps.json(res, 409, { error: 'An article with this title or URL slug already exists. Choose a different title.' });
       const article = cleanArticle(body, existing);
       if (articles.some(a => a.id === article.id && a.id !== existing?.id)) return deps.json(res, 409, { error: 'An article already uses that URL slug.' });
       const next = existing ? articles.map(a => a.id === existing.id ? article : a) : [...articles, article];
