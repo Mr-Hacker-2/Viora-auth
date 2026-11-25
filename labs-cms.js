@@ -85,7 +85,7 @@ async function readArticles(deps) {
 }
 async function referenced(id, publicOnly, deps) {
   const [tools, articles] = await Promise.all([readTools(deps), readArticles(deps)]);
-  return tools.some(t => t.active !== false && t.imageId === id) ||
+  return tools.some(t => (!publicOnly || t.active !== false) && t.imageId === id) ||
     articles.some(a => (!publicOnly || a.status === 'published') &&
       (a.coverImageId === id || (a.blocks || []).some(b => b.type === 'image' && b.imageId === id)));
 }

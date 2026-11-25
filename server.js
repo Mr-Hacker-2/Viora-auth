@@ -98,7 +98,7 @@ const voice = createVoiceService();
 const speech = createSpeechService();
 const speakHits = new Map();
 const speakLimited = (k) => { const n = Date.now(), a = (speakHits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); speakHits.set(k, a); return a.length > 120; };
-const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Vary': 'Origin' });
+const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS', 'Vary': 'Origin' });
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', ...cors() }); res.end(JSON.stringify(obj)); };
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
 const accountAuthCache = new Map();
