@@ -116,3 +116,46 @@ test('uploaded image stays private until referenced by an active public tool', a
   assert.equal(res.headers['Content-Type'], 'image/png');
   assert.equal(res.binary.length, png.length);
 });
+
+test('admin can preview an uploaded image before it is saved, while the public cannot', async () => {
+  const { deps, res } = harness();
+  const png = Buffer.from([137,80,78,71,13,10,26,10]);
+  await handleLabsAdmin({ method:'POST', body:{ contentType:'image/png', data:png.toString('base64') } }, res, { pathname:'/api/admin/labs/media' }, 'admin@example.com', deps);
+  const id = res.body.imageId;
+  await handleLabsAdmin({ method:'GET' }, res, { pathname:'/api/admin/labs/media/'+id }, 'admin@example.com', deps);
+  assert.equal(res.code, 200);
+  assert.equal(res.headers['Cache-Control'], 'private, no-store');
+  await handleLabsPublic({ method:'GET' }, res, { pathname:'/api/labs/media/'+id }, deps);
+  assert.equal(res.code, 404);
+});
+
+test('creating a new article with an existing title is rejected instead of overwriting it', async () => {
+  const { deps, res, store } = harness();
+  const a = { title:'Same Title', subtitle:'Original', status:'draft', blocks:[{type:'paragraph',text:'Original body'}] };
+  await handleLabsAdmin({ method:'POST', body:{ ...a, isNew:true } }, res, { pathname:'/api/admin/labs/articles' }, 'admin@example.com', deps);
+  assert.equal(res.code, 201);
+  await handleLabsAdmin({ method:'POST', body:{ ...a, subtitle:'Replacement', isNew:true } }, res, { pathname:'/api/admin/labs/articles' }, 'admin@example.com', deps);
+  assert.equal(res.code, 409);
+  assert.equal(store.get('labs/articles.json').articles[0].subtitle, 'Original');
+  // editing the same article (no isNew flag) still works
+  await handleLabsAdmin({ method:'POST', body:{ ...a, id:'same-title', subtitle:'Edited' } }, res, { pathname:'/api/admin/labs/articles' }, 'admin@example.com', deps);
+  assert.equal(res.code, 200);
+});
+
+test('publication date is honoured, validated, and future dates stay hidden from the public', async () => {
+  const { deps, res } = harness();
+  const base = { id:'dated', title:'Dated', subtitle:'Has a date', status:'published', blocks:[{type:'paragraph',text:'x'}] };
+  await handleLabsAdmin({ method:'POST', body:{ ...base, publishedAt:'2026-01-05T12:00:00Z' } }, res, { pathname:'/api/admin/labs/articles' }, 'a@example.com', deps);
+  assert.equal(res.body.article.publishedAt, '2026-01-05T12:00:00.000Z');
+  await handleLabsPublic({ method:'GET' }, res, { pathname:'/api/labs/content' }, deps);
+  assert.equal(res.body.articles.length, 1);
+  await handleLabsAdmin({ method:'POST', body:{ ...base, publishedAt:'2999-01-01T00:00:00Z' } }, res, { pathname:'/api/admin/labs/articles' }, 'a@example.com', deps);
+  assert.equal(res.code, 400);
+  const future = new Date(Date.now() + 864e5).toISOString();
+  await handleLabsAdmin({ method:'POST', body:{ ...base, publishedAt:future } }, res, { pathname:'/api/admin/labs/articles' }, 'a@example.com', deps);
+  assert.equal(res.code, 200);
+  await handleLabsPublic({ method:'GET' }, res, { pathname:'/api/labs/content' }, deps);
+  assert.equal(res.body.articles.length, 0);
+  await handleLabsAdmin({ method:'POST', body:{ ...base, publishedAt:'not a date' } }, res, { pathname:'/api/admin/labs/articles' }, 'a@example.com', deps);
+  assert.equal(res.code, 400);
+});
