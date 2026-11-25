@@ -14,6 +14,7 @@ import { planThink, THINK_GUIDE, THINK_LIMITS, thinkTemperature, thinkReport, cr
 import { accountFlowDecision } from './auth-flow.js';
 import { clientIp, seenUpdate, cleanLocation, locationPrompt, adminLocation, NO_LOCATION_PROMPT } from './visitor.js';
 import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
+import { handleLabsAdmin, handleLabsPublic } from './labs-cms.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
 const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
@@ -96,7 +97,7 @@ const voice = createVoiceService();
 const speech = createSpeechService();
 const speakHits = new Map();
 const speakLimited = (k) => { const n = Date.now(), a = (speakHits.get(k) || []).filter((t) => n - t < 60e3); a.push(n); speakHits.set(k, a); return a.length > 120; };
-const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Vary': 'Origin' });
+const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS', 'Vary': 'Origin' });
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', ...cors() }); res.end(JSON.stringify(obj)); };
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
 const accountAuthCache = new Map();
@@ -682,6 +683,8 @@ async function handleAdmin(req, res, u) {
   const actor = auth.user.email;
   if (limited('admin:' + actor)) return json(res, 429, { error: 'Slow down a little, then try again.' });
   const path = u.pathname;
+  const labsHandled = await handleLabsAdmin(req, res, u, actor, { b2Ready, getJson, putJson, getObject, putObject, readBody, audit: writeAdminAudit, cors, json: (response, code, data) => { json(response, code, data); return true; } });
+  if (labsHandled) return;
   if (req.method === 'GET' && path === '/api/admin/session') {
     return json(res, 200, { ok: true, role: 'admin', email: actor });
   }
@@ -1581,6 +1584,7 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, BASE);
   try {
     if (req.method === 'OPTIONS') { res.writeHead(204, cors()); return res.end(); }
+    if (u.pathname.startsWith('/api/labs/')) return await handleLabsPublic(req, res, u, { b2Ready, getJson, getObject, cors, json });
     if (u.pathname.startsWith('/api/planner/')) return await handlePlanner(req, res, u);
     if (req.method === 'POST' && u.pathname === '/api/admin/login') return await handleAdminPasswordLogin(req, res);
     if (u.pathname.startsWith('/api/admin/')) return await handleAdmin(req, res, u);
