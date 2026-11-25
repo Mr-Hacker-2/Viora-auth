@@ -84,3 +84,35 @@ test('image uploads reject unsupported MIME types and oversized data', async () 
   assert.equal(res.code, 400);
   assert.equal([...store.keys()].some(k => k.startsWith('labs/media/')), false);
 });
+
+
+test('tools can be removed by publishing the remaining tool list and articles can be deleted', async () => {
+  const { deps, res, store } = harness();
+  const initial = [...defaultLabsTools(), { id:'new-tool', name:'New Tool', short:'Temporary tool', active:true, order:5 }];
+  await handleLabsAdmin({ method:'POST', body:{ tools:initial } }, res, { pathname:'/api/admin/labs/tools' }, 'admin@example.com', deps);
+  assert.equal(res.code, 200);
+  await handleLabsAdmin({ method:'POST', body:{ tools:defaultLabsTools() } }, res, { pathname:'/api/admin/labs/tools' }, 'admin@example.com', deps);
+  assert.equal(store.get('labs/tools.json').tools.some(t => t.id === 'new-tool'), false);
+
+  const article = { id:'remove-me', title:'Remove me', subtitle:'Temporary article', status:'draft', blocks:[{type:'paragraph',text:'Draft'}] };
+  await handleLabsAdmin({ method:'POST', body:article }, res, { pathname:'/api/admin/labs/articles' }, 'admin@example.com', deps);
+  await handleLabsAdmin({ method:'DELETE' }, res, { pathname:'/api/admin/labs/articles/remove-me' }, 'admin@example.com', deps);
+  assert.equal(res.code, 200);
+  assert.equal(store.get('labs/articles.json').articles.length, 0);
+});
+
+test('uploaded image stays private until referenced by an active public tool', async () => {
+  const { deps, res, store } = harness();
+  const png = Buffer.from([137,80,78,71,13,10,26,10]);
+  await handleLabsAdmin({ method:'POST', body:{ contentType:'image/png', data:png.toString('base64') } }, res, { pathname:'/api/admin/labs/media' }, 'admin@example.com', deps);
+  assert.equal(res.code, 201);
+  const imageId = res.body.imageId;
+  await handleLabsPublic({ method:'GET' }, res, { pathname:'/api/labs/media/'+imageId }, deps);
+  assert.equal(res.code, 404);
+  const tools = defaultLabsTools(); tools[0].imageId = imageId;
+  store.set('labs/tools.json', { tools });
+  await handleLabsPublic({ method:'GET' }, res, { pathname:'/api/labs/media/'+imageId }, deps);
+  assert.equal(res.code, 200);
+  assert.equal(res.headers['Content-Type'], 'image/png');
+  assert.equal(res.binary.length, png.length);
+});
