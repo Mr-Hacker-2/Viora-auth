@@ -73,3 +73,14 @@ Audio is handled in memory for one request: it is never written to disk, never l
 
 **NVIDIA** (fallback) is *not* the same request format. The hosted `whisper-large-v3` is a Riva **gRPC** service: `grpc.nvcf.nvidia.com:443`, method `/nvidia.riva.asr.RivaSpeechRecognition/Recognize`, metadata `function-id` and `authorization: Bearer $NVIDIA_API_KEY`, a protobuf `RecognizeRequest`, and audio that must be mono 16-bit WAV, OPUS or FLAC. Browser recordings are webm or mp4, so the server converts them to mono 16 kHz FLAC with `ffmpeg` (stdin to stdout, nothing on disk). The protobuf and gRPC framing are written against `node:http2`, so the server still has no dependencies. Render's Node runtime does not include ffmpeg by default: without it the NVIDIA fallback reports itself unavailable and Groq alone is used.
 
+
+## Personal Intelligence (opt-in public footprint discovery)
+
+Routes (all require the signed-in session; every route only reads or writes the caller's own data, stored privately at `intel/<sha256(email)>.json` in B2):
+`GET /api/intel`, `POST /api/intel/consent` `{enable, acknowledge}`, `POST /api/intel/discover`, `POST|DELETE /api/intel/findings/:id`, `PUT /api/intel/profile`, `DELETE /api/intel`.
+
+- Discovery requires `emailVerified: true` on the account (Google sign-in), so nobody can register another person's address and look them up. Password-only accounts are refused until a verification flow exists.
+- Sources: GitHub REST user search (`in:email`, only matches emails users made public), Gravatar REST v3 profile for the email hash, Brave Search API exact-email search. No scraping, no logins.
+- Env vars: `BRAVE_SEARCH_API_KEY` (required for web results; without it that source reports "not configured"), `GITHUB_TOKEN` and `GRAVATAR_API_KEY` (optional, higher rate limits).
+- One discovery run per account every 10 minutes (in-memory). Findings stay `pending` until the user approves; only approved, request-relevant profile items (max 8) are added to the chat system prompt for Flash, Pro Search and Math & Code. The Humanizer gets none, so rewrites never gain facts.
+- Account deletion also deletes the Personal Intelligence object.
