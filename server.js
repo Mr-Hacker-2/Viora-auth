@@ -104,8 +104,10 @@ async function accountAllowed(email) {
   if (!b2Ready()) return true;
   const key = normEmail(email), cached = accountAuthCache.get(key);
   if (cached && cached.until > Date.now()) return cached.allowed;
-  const record = await getJson(userKey(key));
-  const allowed = record?.status !== 'suspended';
+  const digest = crypto.createHash('sha256').update(key).digest('hex');
+  const deleted = await getJson(`deleted/${digest}.json`);
+  const record = deleted ? null : await getJson(userKey(key));
+  const allowed = !deleted && record?.status !== 'suspended';
   accountAuthCache.set(key, { allowed, until: Date.now() + 10000 });
   return allowed;
 }
@@ -1704,9 +1706,69 @@ http.createServer(async (req, res) => {
       const user = await userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
       if (!b2Ready()) return json(res, 200, { premium: false, premiumUntil: null, credits: null, enforced: false });
-      try { return json(res, 200, { ...planOf(await getJson(userKey(user.email))), enforced: CREDITS_ENFORCED }); }
+      try { const record = await getJson(userKey(user.email)); return json(res, 200, { ...planOf(record), enforced: CREDITS_ENFORCED, name: record?.name || user.name || null, createdAt: record?.createdAt || null, provider: record?.provider || record?.signedUpVia || 'google' }); }
       catch { return json(res, 503, { error: 'Your plan could not be read right now.' }); }
     }
+    if (u.pathname === '/api/account/profile' && req.method === 'POST') {
+      const user = await userOf(req);
+      if (!user) return json(res, 401, { error: 'Please sign in again.' });
+      if (!b2Ready()) return json(res, 503, { error: 'Account storage is not configured.' });
+      let body; try { body = await readBody(req, 2000); } catch { return json(res, 400, { error: 'Invalid profile update.' }); }
+      const name = typeof body.name === 'string' ? body.name.trim().slice(0, 80) : '';
+      if (!name) return json(res, 400, { error: 'Enter a display name.' });
+      try {
+        const key = userKey(user.email), record = await getJson(key);
+        if (!record || record.status === 'suspended') return json(res, 404, { error: 'Account not found.' });
+        await putJson(key, { ...record, name, profileUpdatedAt: new Date().toISOString() });
+        return json(res, 200, { ok: true, name });
+      } catch {
+        return json(res, 503, { error: 'Your profile could not be saved. Please try again.' });
+      }
+    }
+
+    if (u.pathname === '/api/account/delete' && req.method === 'POST') {
+      const bearer = (req.headers.authorization || '').replace(/^Bearer /, '');
+      const session = unsign(bearer);
+      if (!session?.email) return json(res, 401, { error: 'Please sign in again.' });
+      const email = normEmail(session.email);
+      if (!b2Ready()) return json(res, 503, { error: 'Account storage is not configured. Your account was not deleted.' });
+      let body; try { body = await readBody(req, 2000); } catch { return json(res, 400, { error: 'Invalid deletion confirmation.' }); }
+      if (body.confirmation !== 'DELETE' || normEmail(body.email) !== email) {
+        return json(res, 400, { error: 'Enter your account email and type DELETE to confirm.' });
+      }
+      const digest = crypto.createHash('sha256').update(email).digest('hex');
+      const tombstoneKey = `deleted/${digest}.json`;
+      const filesPrefix = `planner-files/${digest}/`;
+      try {
+        // The hashed tombstone prevents any still-valid signed session from reopening a deleted account.
+        // It contains no email, password, profile, or conversation content.
+        await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), version: 1 });
+        accountAuthCache.delete(email);
+        const fileKeys = [];
+        let cursor = '';
+        do {
+          const page = await listKeys(filesPrefix, cursor, 1000);
+          fileKeys.push(...page.keys);
+          if (fileKeys.length > 100000) throw new Error('too_many_account_files');
+          cursor = page.truncated ? page.nextToken : '';
+          if (page.truncated && !cursor) throw new Error('storage_pagination_failed');
+        } while (cursor);
+        for (let i = 0; i < fileKeys.length; i += 50) {
+          const results = await Promise.allSettled(fileKeys.slice(i, i + 50).map(key => deleteObject(key)));
+          if (results.some(result => result.status === 'rejected')) throw new Error('account_file_cleanup_failed');
+        }
+        await deleteObject(plannerKey(email));
+        await deleteObject(userKey(email));
+        answerCache.delete(email);
+        seenCache.delete(email);
+        plannerWriteQueues.delete(email);
+        return json(res, 200, { ok: true, deleted: true });
+      } catch (error) {
+        console.error('Account deletion did not finish:', error?.message || error);
+        return json(res, 503, { error: 'Deletion could not finish because private storage is temporarily unavailable. Please retry the deletion from Settings.' });
+      }
+    }
+
     if (u.pathname === '/api/profile') {
       const user = await userOf(req);
       if (!user) return json(res, 401, { error: 'Please sign in again.' });
