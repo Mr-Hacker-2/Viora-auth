@@ -913,6 +913,8 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
   }
   try {
     const key = userKey(user.email), now = new Date().toISOString();
+    const digest = crypto.createHash('sha256').update(normEmail(user.email)).digest('hex');
+    if (await getJson(`deleted/${digest}.json`)) return { authError: 'account_deleted' };
     const old = await getJson(key);
     // Website sign-in may discover account state only after Google has verified
     // ownership of this email. A new profile requires an explicit sign-up choice.
