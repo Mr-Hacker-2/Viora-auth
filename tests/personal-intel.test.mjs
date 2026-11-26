@@ -71,3 +71,17 @@ test('AI context: only relevant items, nothing when disabled', () => {
   assert.doesNotMatch(ctx, /climbing|Python/);
   assert.equal(relevantContext({ ...intel, enabled: false }, 'rust'), '');
 });
+
+test('adult confirmation and first-run discovery state are explicit and normalised', () => {
+  const fresh = emptyIntel();
+  assert.equal(fresh.enabled, false);
+  assert.equal(fresh.adultConfirmedAt, null);
+  assert.equal(fresh.discoveryPending, false);
+  const saved = cleanIntel({ enabled: true, adultConfirmedAt: '2026-11-26T00:00:00.000Z', discoveryPending: true });
+  assert.equal(saved.enabled, true);
+  assert.equal(saved.adultConfirmedAt, '2026-11-26T00:00:00.000Z');
+  assert.equal(saved.discoveryPending, true);
+  const invalid = cleanIntel({ adultConfirmedAt: 123, discoveryPending: 'yes' });
+  assert.equal(invalid.adultConfirmedAt, null);
+  assert.equal(invalid.discoveryPending, false);
+});
