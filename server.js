@@ -1735,7 +1735,8 @@ async function chat(req, res, user) {
 
 /* ================= Personal Intelligence (opt-in, per-account, stored privately in B2) ================= */
 const intelCache = new Map();
-const intelRuns = new Map(); // email -> last discovery time (one run per 10 minutes per account)
+const intelRuns = new Map(); // email -> last successful discovery time (one run per 10 minutes per account)
+const intelInFlight = new Set(); // prevent overlapping searches for the same account
 async function cachedIntel(email) {
   if (!b2Ready()) return null;
   // Check the account's explicit opt-in on every AI request. This makes opt-out effective
@@ -1860,15 +1861,28 @@ async function handleIntel(req, res, u) {
       if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified.' });
       if (!intel.enabled || account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt) return json(res, 403, { code: 'not_enabled', error: 'Turn on Personal Intelligence discovery first.' });
       if (!intel.adultConfirmedAt) return json(res, 403, { code: 'adult_confirmation_required', error: 'Confirm that you are 18 or older before discovery can run.' });
+      if (intelInFlight.has(email)) return json(res, 409, { code: 'discovery_in_progress', error: 'A discovery run is already in progress for this account. Please wait for it to finish.' });
       const last = intelRuns.get(email) || 0;
-      if (Date.now() - last < 10 * 60e3) return json(res, 429, { code: 'rate_limited', error: 'Discovery can run once every 10 minutes.' });
-      intelRuns.set(email, Date.now());
-      const { findings, report } = await discover(email);
-      intel = { ...intel, findings: mergeFindings(intel.findings, findings), discoveryPending: false, lastRunAt: new Date().toISOString(), lastRunReport: report };
-      intel = cleanIntel(intel);
-      if (intel.autoApproveStrong) intel = autoApproveStrong(intel);
-      await saveIntel(email, intel);
-      return json(res, 200, intelView(intel, verified, account));
+      if (Date.now() - last < 10 * 60e3) {
+        const seconds = Math.ceil((10 * 60e3 - (Date.now() - last)) / 1000);
+        return json(res, 429, { code: 'rate_limited', retryAfterSeconds: seconds, error: 'A successful discovery ran recently. You can run another search in about ' + Math.ceil(seconds / 60) + ' minute' + (Math.ceil(seconds / 60) === 1 ? '' : 's') + '.' });
+      }
+      intelInFlight.add(email);
+      try {
+        const { findings, report } = await discover(email);
+        // Failed or unconfigured providers must not consume the ten-minute cooldown.
+        // Keep a queued first run pending so the app can automatically retry on its next open.
+        const sourceSucceeded = report.some(item => item.status === 'ok');
+        const completedAt = new Date().toISOString();
+        intel = { ...intel, findings: mergeFindings(intel.findings, findings), discoveryPending: !sourceSucceeded, lastRunAt: sourceSucceeded ? completedAt : intel.lastRunAt, lastRunReport: report };
+        intel = cleanIntel(intel);
+        if (intel.autoApproveStrong) intel = autoApproveStrong(intel);
+        await saveIntel(email, intel);
+        if (sourceSucceeded) intelRuns.set(email, Date.now());
+        return json(res, 200, intelView(intel, verified, account));
+      } finally {
+        intelInFlight.delete(email);
+      }
     }
     const m = path.match(/^\/api\/intel\/findings\/([a-f0-9]{16})$/);
     if (m) {
