@@ -88,6 +88,27 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(intelState.enabled, true, 'Google sign-up stores the explicit discovery opt-in');
   assert.equal(intelState.discoveryPending, true, 'first discovery is queued until the signed-in app opens');
   assert.equal(intelState.emailVerified, true);
+  assert.equal(intelState.autoApproveStrong, false, 'automatic approval defaults off');
+  response = await fetch(`${base}/api/intel/settings`, { method: 'POST', headers: intelHeaders, body: JSON.stringify({ autoApproveStrong: true }) });
+  assert.equal(response.status, 200, 'verified opted-in account can enable automatic approval');
+  intelState = await response.json();
+  assert.equal(intelState.autoApproveStrong, true);
+  response = await fetch(`${base}/api/intel/discover`, { method: 'POST', headers: intelHeaders, body: '{}' });
+  assert.equal(response.status, 200, 'discovery uses the mock public providers');
+  intelState = await response.json();
+  const autoMatch = intelState.findings.find(f => f.confidence === 'strong');
+  const possibleMatch = intelState.findings.find(f => f.confidence === 'possible');
+  assert.ok(autoMatch && possibleMatch);
+  assert.equal(autoMatch.status, 'approved');
+  assert.equal(autoMatch.autoApproved, true);
+  assert.equal(possibleMatch.status, 'pending');
+  assert.equal(possibleMatch.autoApproved, false);
+  assert.ok(intelState.profile.background.includes('Mock API test profile'));
+  response = await fetch(`${base}/api/intel/findings/${autoMatch.id}`, { method: 'POST', headers: intelHeaders, body: JSON.stringify({ status: 'rejected' }) });
+  assert.equal(response.status, 200);
+  intelState = await response.json();
+  assert.equal(intelState.findings.find(f => f.id === autoMatch.id).autoApproved, false);
+  assert.ok(!intelState.profile.background.includes('Mock API test profile'), 'rejecting auto-approved finding removes its uniquely supplied fact');
   response = await fetch(`${base}/api/intel/consent`, { method: 'POST', headers: intelHeaders, body: JSON.stringify({ enable: true, acknowledge: true }) });
   assert.equal(response.status, 400, 'server requires adult confirmation even when the user has an existing opt-in');
   response = await fetch(`${base}/api/intel/profile`, { method: 'PUT', headers: intelHeaders, body: JSON.stringify({ profile: { skills: ['Rust'] } }) });
@@ -103,6 +124,8 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/intel`, { headers: { Authorization: 'Bearer ' + otherToken } });
   const otherIntel = await response.json();
   assert.equal(otherIntel.enabled, false);
+  assert.equal(otherIntel.autoApproveStrong, false, 'user B cannot see user A automatic-approval setting');
+  assert.deepEqual(otherIntel.findings, [], 'user B cannot see user A findings');
   assert.deepEqual(otherIntel.profile.skills, [], 'a second account cannot read the first account\'s profile');
   response = await fetch(`${base}/api/intel?email=${encodeURIComponent(otherEmail)}`, { headers: intelHeaders });
   intelState = await response.json();
@@ -116,6 +139,8 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/intel`, { headers: intelHeaders });
   intelState = await response.json();
   assert.equal(intelState.enabled, false);
+  assert.equal(intelState.autoApproveStrong, false, 'deletion clears automatic approval');
+  assert.deepEqual(intelState.findings, [], 'deletion clears all findings');
   assert.deepEqual(intelState.profile.skills, [], 'deleted profile does not reappear from an older object version');
 
   const passwordSignup = await fetch(`${base}/api/auth/signup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'pending.email@example.com', password: 'ValidPassword123!', terms: true, personalIntelOptIn: true, personalIntelAdultConfirmed: true }) });
