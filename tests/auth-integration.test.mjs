@@ -25,7 +25,7 @@ test('website OAuth requires explicit sign-up and verifies account state after G
       GOOGLE_CLIENT_ID: 'test-client', GOOGLE_CLIENT_SECRET: 'test-secret', TOKEN_SECRET: 'integration-test-secret',
       B2_KEY_ID: 'test-key', B2_APP_KEY: 'test-app-key', B2_BUCKET: 'viora-test',
       B2_ENDPOINT: `http://127.0.0.1:${b2Port}`, B2_REGION: 'us-east-005', MOCK_B2_PORT: String(b2Port),
-      MOCK_USER_EMAIL: 'new.user@example.com', ADMIN_EMAILS: 'new.user@example.com'
+      MOCK_USER_EMAIL: 'new.user@example.com', MOCK_INTEL_FAIL_FIRST_RUN: '1', ADMIN_EMAILS: 'new.user@example.com'
     }
   });
   t.after(() => child.kill());
@@ -88,6 +88,20 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(intelState.enabled, true, 'Google sign-up stores the explicit discovery opt-in');
   assert.equal(intelState.discoveryPending, true, 'first discovery is queued until the signed-in app opens');
   assert.equal(intelState.emailVerified, true);
+  response = await fetch(`${base}/api/intel/discover`, { method: 'POST', headers: intelHeaders, body: '{}' });
+  assert.equal(response.status, 200, 'a temporary provider outage is reported without failing the discovery API');
+  intelState = await response.json();
+  assert.equal(intelState.discoveryPending, true, 'failed first discovery remains queued for automatic retry');
+  assert.ok(intelState.lastRunReport.some(item => item.status === 'error'), 'provider failures are shown in the source report');
+  response = await fetch(`${base}/api/intel/discover`, { method: 'POST', headers: intelHeaders, body: '{}' });
+  assert.equal(response.status, 200, 'a failed provider attempt does not consume the ten-minute cooldown');
+  intelState = await response.json();
+  assert.equal(intelState.discoveryPending, false, 'successful retry clears the queued first discovery');
+  response = await fetch(`${base}/api/intel/discover`, { method: 'POST', headers: intelHeaders, body: '{}' });
+  assert.equal(response.status, 429, 'a successful discovery still observes the ten-minute cooldown');
+  const cooldown = await response.json();
+  assert.ok(cooldown.retryAfterSeconds > 0, 'the cooldown response includes an accurate retry time');
+
   response = await fetch(`${base}/api/intel/consent`, { method: 'POST', headers: intelHeaders, body: JSON.stringify({ enable: true, acknowledge: true }) });
   assert.equal(response.status, 400, 'server requires adult confirmation even when the user has an existing opt-in');
   response = await fetch(`${base}/api/intel/profile`, { method: 'PUT', headers: intelHeaders, body: JSON.stringify({ profile: { skills: ['Rust'] } }) });
