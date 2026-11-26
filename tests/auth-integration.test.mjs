@@ -86,6 +86,26 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   destination = new URL(response.headers.get('location'));
   assert.ok(new URLSearchParams(destination.hash.slice(1)).get('token'), 'returning account signs in normally');
 
+  response = await fetch(`${base}/api/account/delete`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + createdToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: newEmail, confirmation: 'DELETE' })
+  });
+  assert.equal(response.status, 200, 'account deletion removes every account-owned object version');
+  response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer ' + createdToken } });
+  assert.equal(response.status, 401, 'the deleted account session is invalidated');
+
+  response = await callback(await start('signup', newEmail, true));
+  destination = new URL(response.headers.get('location'));
+  assert.equal(destination.pathname, '/signup.html', 'the same verified email can create a fresh account');
+  const freshToken = new URLSearchParams(destination.hash.slice(1)).get('token');
+  assert.ok(freshToken);
+  assert.notEqual(freshToken, createdToken);
+  response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer ' + createdToken } });
+  assert.equal(response.status, 401, 'an old session cannot access the newly created account');
+  response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer ' + freshToken } });
+  assert.equal(response.status, 200, 'the fresh account has its own valid session');
+
   response = await fetch(`${base}/api/admin/users`);
   assert.equal(response.status, 401, 'admin API rejects unauthenticated requests');
 });
