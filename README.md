@@ -59,23 +59,36 @@ and the answers to the 5 sign-up questions (`profile.js`). Only the fixed option
 ## Pro Search
 
 The chat route accepts `researchMode: "quick" | "deep"` and an optional opaque `researchRequestId`.
-Quick Search runs one bounded provider pass and reads up to four pages. Deep Research runs up to three
-focused searches in parallel, deduplicates and ranks up to ten results, then attempts to read up to six
-pages. Provider/page-fetch progress is stored in memory for at most two minutes and scoped to the
-authenticated user. Disconnecting the chat aborts active search, page retrieval, and model requests.
-The response includes short retrieved-page excerpts for expandable source previews; provider page
-text remains bounded before it is sent to the model or returned to the browser.
+
+For best web coverage, configure `BRAVE_SEARCH_API_KEY` as a private Render environment variable in the
+auth service. Viora then uses Brave's LLM Context API as its primary research provider: it retrieves
+ranked public pages with pre-extracted passages, source URLs, publisher metadata, and available dates.
+Requests use strict SafeSearch, balanced relevance filtering, source metadata, and bounded context
+budgets. The key is sent only from the server and is never returned to the browser or included in logs.
+If the key is absent or Brave is temporarily unavailable, Viora continues with its existing RSS/search
+fallback providers; an unavailable provider does not erase results from providers that succeeded.
+
+Quick Search runs a bounded search pass and reads up to four pages. Deep Research runs up to three
+focused searches, deduplicates and ranks up to ten results, then attempts to read up to six pages.
+Deep mode increases the context budget and query coverage without making an unbounded crawl. Provider
+and page-fetch progress is stored in memory for at most two minutes and scoped to the authenticated
+user. Disconnecting the chat aborts active search, page retrieval, and model requests. The response
+includes short retrieved-page excerpts for expandable source previews; provider page text remains
+bounded before it is sent to the model or returned to the browser.
 
 Book-content searches also query Google Books and accept only records whose title matches the requested
-work. General search providers use stricter topic matching so a single generic word does not admit an
-unrelated result. The response distinguishes provider failure from a completed search with no relevant
-sources, reports page-read failures, and says how many retrieved records were supplied to the model.
-Search errors are included in the streamed research metadata and answer context.
+work. General search providers use topic matching to filter unrelated results. The response distinguishes
+provider failure from a completed search with no relevant sources, reports page-read failures, and says
+how many retrieved records were supplied to the model. Search errors are included in streamed research
+metadata and answer context.
 
-Ranking combines topic overlap with modest government/academic/documentation domain hints. It is a
-search heuristic, not a source-quality judgment. Citation numbers point to returned source URLs, but
-the API does not independently verify each claim against the cited page. Do not report claim-level fact
-verification as complete.
+Ranking combines topic relevance, publisher diversity, freshness where available, and modest
+government/academic/documentation domain hints. These are ranking signals, not proof that a source is
+accurate. Web page content is treated as untrusted data, never as instructions. Citation numbers point
+to returned source URLs, and source passages are supplied to the model; however, the API does not
+independently verify every final claim against its cited page. The assistant must state when evidence is
+missing, conflicting, or snippet-only, and must not claim independent fact verification.
+
 ## Admin control center
 
 The static website includes a protected `/admin/` control center. It does not trust browser-stored roles; every `/api/admin/*` request verifies the signed Viora session and then checks the server-side `ADMIN_EMAILS` bootstrap list or the account's stored admin role. Set `ADMIN_EMAILS` in Render to one or more comma-separated owner email addresses before using it. If unset, no first administrator is granted. The `/admin/` page also supports a server-verified password sign-in: set `ADMIN_ACCESS_PASSWORD` in Render to a unique secret (never put it in the website code). The password route is rate limited, compares the secret in constant time, issues a 12-hour signed token for the first `ADMIN_EMAILS` identity, and records successful/denied attempts when B2 is configured. The browser stores this token only for the current tab session. If either variable is missing, password sign-in fails closed.
