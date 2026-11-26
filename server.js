@@ -1071,10 +1071,15 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
     };
     await putJson(key, rec);
     if (optedIntoIntel) {
-      const priorIntel = cleanIntel(await getJson(intelKey(user.email)));
-      if (!priorIntel.enabled) {
-        await putJson(intelKey(user.email), { ...priorIntel, enabled: true, consentAt: priorIntel.consentAt || now, adultConfirmedAt: priorIntel.adultConfirmedAt || now, discoveryPending: true });
-        intelCache.delete(normEmail(user.email));
+      try {
+        const priorIntel = cleanIntel(await getJson(intelKey(user.email)));
+        if (!priorIntel.enabled) {
+          await putJson(intelKey(user.email), { ...priorIntel, enabled: true, consentAt: priorIntel.consentAt || now, adultConfirmedAt: priorIntel.adultConfirmedAt || rec.personalIntelAdultConfirmedAt || now, discoveryPending: true });
+          intelCache.delete(normEmail(user.email));
+        }
+      } catch (error) {
+        // The optional feature must never prevent a verified account from signing in.
+        console.warn('Personal Intelligence opt-in queued but profile storage is temporarily unavailable:', error?.message || error);
       }
     }
     await writeAdminAudit(user.email, 'login', user.email, 'success');
@@ -1778,6 +1783,12 @@ async function handleIntel(req, res, u) {
     const account = await getJson(userKey(email));
     const verified = account?.emailVerified === true;
     let intel = cleanIntel(await getJson(intelKey(email)));
+    // Recover a saved signup opt-in if writing the initial intelligence object failed during OAuth.
+    if (verified && account?.personalIntelOptIn === true && typeof account.personalIntelAdultConfirmedAt === 'string' && !intel.adultConfirmedAt) {
+      const now = new Date().toISOString();
+      intel = { ...intel, enabled: true, consentAt: intel.consentAt || now, adultConfirmedAt: account.personalIntelAdultConfirmedAt, discoveryPending: true };
+      await saveIntel(email, intel);
+    }
     // Older opt-ins predate the adult-only safeguard. Require a fresh explicit opt-in.
     if (intel.enabled && !intel.adultConfirmedAt) {
       intel.enabled = false; intel.discoveryPending = false;
