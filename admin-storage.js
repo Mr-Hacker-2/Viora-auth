@@ -139,7 +139,7 @@ export function createStorageAdmin({ b2Ready, getBucketInfo, listObjects, listOb
   async function execute(actor, { planId, confirmation, secondConfirm } = {}) {
     requireStorage();
     const plan = getPlan(planId, actor);
-    const requiredPhrase = plan.mode === 'all' ? 'DELETE ALL VIORA STORAGE' : 'DELETE SELECTED VIORA OBJECTS';
+    const requiredPhrase = plan.mode === 'all' ? 'DELETE ALL VIORA STORAGE' : plan.mode === 'categories' ? 'DELETE SELECTED VIORA CATEGORIES' : 'DELETE SELECTED VIORA OBJECTS';
     if (confirmation !== requiredPhrase || secondConfirm !== true) throw new Error('Both deletion confirmations are required. No objects were deleted.');
     const started = await audit(actor, 'storage_deletion_started', plan.mode === 'all' ? 'all deletable Viora storage' : 'selected Viora objects', 'started', { categories: plan.categories.map(item => item.id), objects: new Set(plan.rows.map(row => row.key)).size, versions: plan.rows.length });
     if (!started) throw new Error('The operation could not start because its audit record could not be saved. No objects were deleted.');
