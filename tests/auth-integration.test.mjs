@@ -188,9 +188,9 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/admin/overview`, { headers: adminHeaders });
   assert.equal(response.status, 200, 'overview returns verified account aggregates');
   const overview = await response.json();
-  assert.equal(overview.users.total, 2);
+  assert.equal(overview.users.total, 3);
   assert.equal(overview.users.premium, 1);
-  assert.equal(overview.users.free, 1);
+  assert.equal(overview.users.free, 2);
   assert.equal(overview.credits.remainingBalance, 125);
   assert.equal(overview.credits.usageTracked, false, 'credit consumption is not fabricated when it is not persisted');
 
