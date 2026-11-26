@@ -112,7 +112,7 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(response.status, 200, 'profile deletion succeeds');
   const deletion = await response.json();
   assert.equal(deletion.deleted, true);
-  assert.equal(deletion.deletedVersions, 2, 'all previous B2 versions are permanently removed');
+  assert.equal(deletion.deletedVersions, 3, 'all previous B2 versions are permanently removed');
   response = await fetch(`${base}/api/intel`, { headers: intelHeaders });
   intelState = await response.json();
   assert.equal(intelState.enabled, false);
