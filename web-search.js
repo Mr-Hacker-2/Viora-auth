@@ -143,6 +143,59 @@ function errorText(error) {
   return message || 'unknown error';
 }
 
+async function fetchBraveContext(query, mode, requestSignal, fetchImpl, attempts) {
+  const apiKey = String(process.env.BRAVE_SEARCH_API_KEY || '').trim();
+  if (!apiKey) return [];
+  const params = new URLSearchParams({
+    q: String(query || '').slice(0, 600),
+    country: 'us',
+    search_lang: 'en',
+    maximum_number_of_urls: mode === 'deep' ? '12' : '8',
+    maximum_number_of_tokens: mode === 'deep' ? '16384' : '8192',
+    context_threshold_mode: 'balanced',
+    safesearch: 'strict',
+    enable_source_metadata: 'true',
+    operators: 'true',
+    operators_fallback: 'true'
+  });
+  const signal = requestSignal
+    ? AbortSignal.any([requestSignal, AbortSignal.timeout(30000)])
+    : AbortSignal.timeout(30000);
+  try {
+    const response = await fetchImpl(`https://api.search.brave.com/res/v1/llm/context?${params}`, {
+      signal,
+      headers: {
+        Accept: 'application/json',
+        'X-Subscription-Token': apiKey,
+        'User-Agent': 'VioraResearch/2.0'
+      }
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    attempts.push({ provider: 'Brave LLM Context', succeeded: true });
+    const grounding = Array.isArray(data?.grounding?.generic) ? data.grounding.generic : [];
+    const metadata = data?.sources && typeof data.sources === 'object' ? data.sources : {};
+    return grounding.map(record => {
+      const url = String(record?.url || '').trim();
+      const meta = metadata[url] || {};
+      const age = Array.isArray(meta.age) ? meta.age : [];
+      const snippets = Array.isArray(record?.snippets) ? record.snippets : [];
+      return {
+        title: record?.title || meta.title || '',
+        url,
+        snippet: snippets.map(value => String(value || '')).filter(Boolean).join('\\n\\n').slice(0, 5000),
+        site: meta.site_name || meta.hostname || '',
+        publishedAt: age[3] || age[1] || '',
+        relevanceScore: snippets.length ? 12 + Math.min(8, snippets.join(' ').length / 500) : 8
+      };
+    }).filter(item => item.title && item.url && item.snippet);
+  } catch (error) {
+    if (requestSignal?.aborted) throw error;
+    attempts.push({ provider: 'Brave LLM Context', succeeded: false, error: errorText(error) });
+    return [];
+  }
+}
+
 export async function searchWeb(query, mode = 'quick', requestSignal = null, fetchImpl = globalThis.fetch) {
   const limits = researchLimits(mode);
   const queries = buildResearchQueries(query, mode).slice(0, limits.queryLimit);
@@ -178,6 +231,9 @@ export async function searchWeb(query, mode = 'quick', requestSignal = null, fet
       const bookTitle = extractBookTitle(searchQuery);
       const intent = classifyIntent(searchQuery, bookTitle);
       const providers = [];
+      if (process.env.BRAVE_SEARCH_API_KEY) {
+        providers.push(fetchBraveContext(searchQuery, mode, requestSignal, fetchImpl, attempts));
+      }
       if (intent === 'book') {
         providers.push((async () => {
           const feed = await get('Google Books', `https://www.google.com/books/feeds/volumes?q=${encodeURIComponent(`intitle:${bookTitle}`)}&max-results=10`);
