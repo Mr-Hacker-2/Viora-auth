@@ -125,8 +125,9 @@ export function createStorageAdmin({ b2Ready, getBucketInfo, listObjects, listOb
     plans.set(planId, plan);
     return {
       planId, mode, expiresAt: new Date(expiresAt).toISOString(),
-      categories: categories.map(({ id, label, prefix, purpose }) => ({ id, label, prefix, purpose, objects: uniqueKeys(rows.filter(row => row.key.startsWith(prefix))), versions: rows.filter(row => row.key.startsWith(prefix) && !row.deleteMarker).length, deleteMarkers: rows.filter(row => row.key.startsWith(prefix) && row.deleteMarker).length, bytes: byteSum(rows.filter(row => row.key.startsWith(prefix) && !row.deleteMarker)) })),
-      objectCount: new Set(rows.filter(row => !row.deleteMarker).map(row => row.key)).size,
+      categories: categories.map(({ id, label, prefix, purpose }) => ({ id, label, prefix, purpose, objects: new Set(rows.filter(row => row.key.startsWith(prefix)).map(row => row.key)).size, versions: rows.filter(row => row.key.startsWith(prefix) && !row.deleteMarker).length, deleteMarkers: rows.filter(row => row.key.startsWith(prefix) && row.deleteMarker).length, bytes: byteSum(rows.filter(row => row.key.startsWith(prefix) && !row.deleteMarker)) })),
+      objectCount: new Set(rows.map(row => row.key)).size,
+      objectKeys: [...new Set(rows.map(row => row.key))].sort(),
       versionCount: rows.filter(row => !row.deleteMarker).length,
       deleteMarkerCount: rows.filter(row => row.deleteMarker).length,
       bytes: byteSum(rows.filter(row => !row.deleteMarker)),
