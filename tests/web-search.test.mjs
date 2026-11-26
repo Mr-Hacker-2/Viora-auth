@@ -185,7 +185,7 @@ test('Brave LLM Context supplies extracted page evidence and source metadata whe
     assert.ok(result.sources.some(source => source.url.includes('raspberrypi.com/documentation')));
     const braveAttempt = result.attempts.find(attempt => attempt.provider === 'Brave LLM Context');
     assert.equal(braveAttempt?.succeeded, true);
-    assert.equal(new URL(requested[0].url).searchParams.get('maximum_number_of_tokens'), '8192');
+    assert.equal(new URL(requested[0].url).searchParams.get('maximum_number_of_tokens'), '8192');\n    assert.equal(requested[0].headers['X-Subscription-Token'], 'test-brave-key');
   } finally {
     if (previousKey === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
     else process.env.BRAVE_SEARCH_API_KEY = previousKey;
