@@ -1881,7 +1881,7 @@ http.createServer(async (req, res) => {
       try {
         // The hashed tombstone prevents any still-valid signed session from reopening a deleted account.
         // It contains no email, password, profile, or conversation content.
-        await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: false, version: 2 });
+        await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: false, accountId: session.accountId || currentRecord?.accountId || null, version: 2 });
         accountAuthCache.set(email, { allowed: false, until: Date.now() + 60 * 60e3 });
         const deletedVersions = await deleteAccountStorageVersions(email, digest);
         await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: true, deletedVersions, version: 2 });
