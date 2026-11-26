@@ -117,7 +117,7 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(response.status, 200, 'administrator can grant a time-limited premium plan');
   assert.equal((await response.json()).premium, true);
   response = await fetch(`${base}/api/admin/users/credits`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ email: otherEmail, set: 125 }) });
-  assert.equal(response.status, 200, 'administrator can set a user's credit balance');
+  assert.equal(response.status, 200, "administrator can set a user's credit balance");
   assert.equal((await response.json()).credits, 125);
   response = await fetch(`${base}/api/admin/users/role`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ email: otherEmail, role: 'admin' }) });
   assert.equal(response.status, 200, 'administrator can grant a stored admin role');
