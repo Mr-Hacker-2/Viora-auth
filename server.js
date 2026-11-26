@@ -974,7 +974,8 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
     const digest = crypto.createHash('sha256').update(normEmail(user.email)).digest('hex');
     const tombstone = await getJson(`deleted/${digest}.json`);
     if (tombstone) {
-      if (!(requireSignupConsent && mode === 'signup')) return { authError: 'account_deleted' };\n      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };\n      await clearCompletedDeletionForSignup(user.email);\n    }
+      if (!(requireSignupConsent && mode === 'signup')) return { authError: 'account_deleted' };
+      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };\n      await clearCompletedDeletionForSignup(user.email);\n    }
     const old = await getJson(key);
     // Website sign-in may discover account state only after Google has verified
     // ownership of this email. A new profile requires an explicit sign-up choice.
