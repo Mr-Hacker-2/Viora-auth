@@ -1738,6 +1738,14 @@ const intelCache = new Map();
 const intelRuns = new Map(); // email -> last discovery time (one run per 10 minutes per account)
 async function cachedIntel(email) {
   if (!b2Ready()) return null;
+  // Check the account's explicit opt-in on every AI request. This makes opt-out effective
+  // even if an old intelligence object or an in-process cache entry still exists.
+  const account = await getJson(userKey(email));
+  if (account?.personalIntelOptIn !== true || account?.emailVerified !== true || typeof account.personalIntelAdultConfirmedAt !== 'string') {
+    const disabled = emptyIntel();
+    intelCache.set(email, { intel: disabled, at: Date.now() });
+    return disabled;
+  }
   const hit = intelCache.get(email);
   if (hit && Date.now() - hit.at < 5 * 60e3) return hit.intel;
   const intel = cleanIntel(await getJson(intelKey(email)));
@@ -1800,11 +1808,16 @@ async function handleIntel(req, res, u) {
     }
     if (req.method === 'GET' && path === '/api/intel') return json(res, 200, intelView(intel, verified));
     if (req.method === 'DELETE' && path === '/api/intel') {
-      const deletedVersions = await deleteIntelStorageVersions(email);
       if (account) {
         const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
         await putJson(userKey(email), accountRest);
       }
+      // Disable AI use before attempting the permanent version purge. If deletion fails,
+      // the user sees an error and can retry, but the old profile is not used meanwhile.
+      intel = { ...intel, enabled: false, discoveryPending: false };
+      intelCache.set(email, { intel, at: Date.now() });
+      await saveIntel(email, intel);
+      const deletedVersions = await deleteIntelStorageVersions(email);
       intelCache.delete(email); intelRuns.delete(email);
       return json(res, 200, { ok: true, deleted: true, deletedVersions });
     }
