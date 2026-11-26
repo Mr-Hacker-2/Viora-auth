@@ -1,7 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
-import { b2Ready, getJson, putJson, userKey, listKeys, putObject, getObject, deleteObject } from './b2.js';
+import { b2Ready, getJson, putJson, userKey, listKeys, putObject, getObject, deleteObject, listObjectVersions, deleteObjectVersion } from './b2.js';
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { contextualResearchQuery, heuristicResearchDecision, researchLimits, researchMode, researchReviewRequiresRetry, shouldReviewResearchAnswer } from './research.js';
 import { buildResearchContext, searchWeb } from './web-search.js';
@@ -102,21 +102,21 @@ const cors = () => ({ 'Access-Control-Allow-Origin': SITE || '*', 'Access-Contro
 const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', ...cors() }); res.end(JSON.stringify(obj)); };
 const readBody = (req, max = 2e6) => new Promise((ok, no) => { let n = 0, b = ''; req.on('data', (c) => { n += c.length; if (n > max) { no(new Error('too big')); req.destroy(); } else b += c; }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); req.on('error', no); });
 const accountAuthCache = new Map();
-async function accountAllowed(email) {
+async function accountAllowed(email, accountId = null) {
   if (!b2Ready()) return true;
   const key = normEmail(email), cached = accountAuthCache.get(key);
   if (cached && cached.until > Date.now()) return cached.allowed;
   const digest = crypto.createHash('sha256').update(key).digest('hex');
   const deleted = await getJson(`deleted/${digest}.json`);
   const record = deleted ? null : await getJson(userKey(key));
-  const allowed = !deleted && record?.status !== 'suspended';
+  const allowed = !deleted && record?.status !== 'suspended' && (!record?.accountId || accountId === record.accountId);
   accountAuthCache.set(key, { allowed, until: Date.now() + 10000 });
   return allowed;
 }
 const userOf = async req => {
   const user = unsign((req.headers.authorization || '').replace(/^Bearer /, ''));
   if (!user || !user.email) return null;
-  return await accountAllowed(user.email) ? { ...user, email: normEmail(user.email) } : null;
+  return await accountAllowed(user.email, user.accountId || null) ? { ...user, email: normEmail(user.email) } : null;
 };
 
 /* The IP address each account last connected from, shown to the administrator (see the Terms and Privacy Policy).
@@ -184,7 +184,55 @@ async function readAdminUsers(maxRecords = 2000) {
 const plannerPending = new Map();
 const plannerWriteQueues = new Map();
 const PLANNER_LIMITS = { projects: 100, tasks: 2500, title: 180, text: 8000, comment: 2000 };
+
 const plannerKey = email => userKey(email).replace(/^users\//, 'planner/');
+async function deleteAccountStorageVersions(email, digest) {
+  const targets = [
+    { prefix: userKey(email), exact: true },
+    { prefix: plannerKey(email), exact: true },
+    { prefix: intelKey(email), exact: true },
+    { prefix: `planner-files/${digest}/`, exact: false }
+  ];
+  let total = 0;
+  for (const target of targets) {
+    const versions = [];
+    let keyMarker = '', versionIdMarker = '';
+    do {
+      const page = await listObjectVersions(target.prefix, keyMarker, versionIdMarker, 1000);
+      versions.push(...page.versions.filter(item => !target.exact || item.key === target.prefix));
+      if (versions.length + total > 100000) throw new Error('too_many_account_versions');
+      if (!page.truncated) break;
+      if (!page.nextKeyMarker || !page.nextVersionIdMarker) throw new Error('storage_version_pagination_failed');
+      keyMarker = page.nextKeyMarker; versionIdMarker = page.nextVersionIdMarker;
+    } while (true);
+    for (let i = 0; i < versions.length; i += 50) {
+      const results = await Promise.allSettled(versions.slice(i, i + 50).map(item => deleteObjectVersion(item.key, item.versionId)));
+      if (results.some(result => result.status === 'rejected')) throw new Error('account_version_cleanup_failed');
+    }
+    total += versions.length;
+  }
+  for (const target of targets) {
+    let keyMarker = '', versionIdMarker = '';
+    do {
+      const page = await listObjectVersions(target.prefix, keyMarker, versionIdMarker, 1000);
+      if (page.versions.some(item => !target.exact || item.key === target.prefix)) throw new Error('account_storage_verification_failed');
+      if (!page.truncated) break;
+      if (!page.nextKeyMarker || !page.nextVersionIdMarker) throw new Error('storage_verification_pagination_failed');
+      keyMarker = page.nextKeyMarker; versionIdMarker = page.nextVersionIdMarker;
+    } while (true);
+  }
+  return total;
+}
+async function clearCompletedDeletionForSignup(email) {
+  const digest = crypto.createHash('sha256').update(normEmail(email)).digest('hex');
+  const key = `deleted/${digest}.json`, tombstone = await getJson(key);
+  if (!tombstone) return false;
+  if (tombstone.deletionComplete !== true) throw new Error('account_deletion_incomplete');
+  await deleteObject(key);
+  if (await getJson(key)) throw new Error('account_tombstone_reset_failed');
+  accountAuthCache.delete(normEmail(email));
+  return true;
+}
 const plannerId = () => crypto.randomUUID();
 const plannerNow = () => new Date().toISOString();
 function emptyPlanner() { return { version: 1, projects: [], tasks: [], activity: [] }; }
@@ -656,22 +704,22 @@ async function handlePasswordAuth(req, res, mode) {
       if (old) return json(res, 409, { error: old.passwordHash ? 'An account with this email already exists. Sign in instead.' : 'This email already has an account. Sign in with Google instead.' });
       const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80) : email.split('@')[0];
       const rec = {
-        createdAt: stamp, signedUpVia: 'signup', onboarded: false, answers: null, email, name, picture: '', provider: 'password', emailVerified: false,
+        createdAt: stamp, accountId: crypto.randomUUID(), signedUpVia: 'signup', onboarded: false, answers: null, email, name, picture: '', provider: 'password', emailVerified: false,
         passwordHash: await hashPassword(password), termsAcceptedAt: stamp, lastLoginAt: stamp, logins: 1
       };
       await putJson(key, rec);
       await writeAdminAudit(email, 'signup_password', email, 'success');
-      return json(res, 200, { token: sign({ email, name, picture: '', exp: Date.now() + 30 * 864e5 }), email, name, picture: '' });
+      return json(res, 200, { token: sign({ email, name, picture: '', accountId: rec.accountId, exp: Date.now() + 30 * 864e5 }), email, name, picture: '' });
     }
     if (typeof password !== 'string' || !password || password.length > PASSWORD_MAX) return json(res, 400, { error: 'Enter your password.' });
     if (old && !old.passwordHash) { await verifyPassword(password, DUMMY_HASH); return json(res, 401, { error: 'This email uses Google sign-in. Choose Continue with Google.' }); }
     const ok = await verifyPassword(password, old?.passwordHash || DUMMY_HASH);
     if (!old || !ok) { await writeAdminAudit(email, 'login_password', email, 'denied'); return json(res, 401, { error: 'Incorrect email or password.' }); }
     if (old.status === 'suspended') { await writeAdminAudit(email, 'login_password', email, 'denied', { reason: 'suspended' }); return json(res, 403, { error: 'This account is currently unavailable. Contact Viora support for help.' }); }
-    await putJson(key, { ...old, lastLoginAt: stamp, logins: (old.logins || 0) + 1 });
+    const accountId = old.accountId || crypto.randomUUID();\n    await putJson(key, { ...old, accountId, lastLoginAt: stamp, logins: (old.logins || 0) + 1 });
     await writeAdminAudit(email, 'login_password', email, 'success');
     passwordAttempts.delete(email);
-    return json(res, 200, { token: sign({ email, name: old.name || '', picture: '', exp: Date.now() + 30 * 864e5 }), email, name: old.name || '', picture: '' });
+    return json(res, 200, { token: sign({ email, name: old.name || '', picture: '', accountId, exp: Date.now() + 30 * 864e5 }), email, name: old.name || '', picture: '' });
   } catch (e) {
     console.error('password auth failed:', e?.message || e);
     return json(res, 502, { error: 'Could not reach account storage. Please try again.' });
@@ -918,7 +966,7 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
   try {
     const key = userKey(user.email), now = new Date().toISOString();
     const digest = crypto.createHash('sha256').update(normEmail(user.email)).digest('hex');
-    if (await getJson(`deleted/${digest}.json`)) return { authError: 'account_deleted' };
+    const tombstone = await getJson(`deleted/${digest}.json`);\n    if (tombstone) {\n      if (!(requireSignupConsent && mode === 'signup')) return { authError: 'account_deleted' };\n      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };\n      await clearCompletedDeletionForSignup(user.email);\n    }
     const old = await getJson(key);
     // Website sign-in may discover account state only after Google has verified
     // ownership of this email. A new profile requires an explicit sign-up choice.
@@ -931,7 +979,7 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
     // can register someone else's address first and keep a way in.
     const { passwordHash: _dropped, ...oldKept } = old || {};
     const rec = {
-      ...(old ? oldKept : { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),
+      ...(old ? oldKept : { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),\n      accountId: old?.accountId || crypto.randomUUID(),
       emailVerified: true,
       email: user.email, name: user.name, picture: user.picture, provider: 'google',
       ...(requireSignupConsent && mode === 'signup' && termsAccepted ? { termsAcceptedAt: old?.termsAcceptedAt || now } : {}),
@@ -1761,7 +1809,7 @@ http.createServer(async (req, res) => {
       const account = await recordSignIn(user, st.mode, { requireSignupConsent: !!st.site, termsAccepted: !!st.termsAccepted });
       if (account?.authError) return back(res, account.authError === 'account_not_found' ? { ...st, email: normEmail(user.email) } : st, { error: account.authError });
       if (account?.status === 'suspended') return back(res, st, { error: 'account_suspended' });
-      return back(res, st, { token: sign({ ...user, exp: Date.now() + 30 * 864e5 }), ...user });
+      return back(res, st, { token: sign({ ...user, accountId: account.accountId, exp: Date.now() + 30 * 864e5 }), ...user });
     }
 
     // A location the person chose to share (their browser asked first). Stored on their account so the administrator can see it; they can clear it.
@@ -1833,25 +1881,11 @@ http.createServer(async (req, res) => {
       try {
         // The hashed tombstone prevents any still-valid signed session from reopening a deleted account.
         // It contains no email, password, profile, or conversation content.
-        await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), version: 1 });
-        accountAuthCache.delete(email);
-        const fileKeys = [];
-        let cursor = '';
-        do {
-          const page = await listKeys(filesPrefix, cursor, 1000);
-          fileKeys.push(...page.keys);
-          if (fileKeys.length > 100000) throw new Error('too_many_account_files');
-          cursor = page.truncated ? page.nextToken : '';
-          if (page.truncated && !cursor) throw new Error('storage_pagination_failed');
-        } while (cursor);
-        for (let i = 0; i < fileKeys.length; i += 50) {
-          const results = await Promise.allSettled(fileKeys.slice(i, i + 50).map(key => deleteObject(key)));
-          if (results.some(result => result.status === 'rejected')) throw new Error('account_file_cleanup_failed');
-        }
-        await deleteObject(plannerKey(email));
-        await deleteObject(intelKey(email));
+        await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: false, version: 2 });
+        accountAuthCache.set(email, { allowed: false, until: Date.now() + 60 * 60e3 });
+        const deletedVersions = await deleteAccountStorageVersions(email, digest);
+        await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: true, deletedVersions, version: 2 });
         intelCache.delete(email);
-        await deleteObject(userKey(email));
         answerCache.delete(email);
         seenCache.delete(email);
         plannerWriteQueues.delete(email);
@@ -1891,7 +1925,7 @@ http.createServer(async (req, res) => {
       // The ?token= form is still accepted so older cached pages and the extension keep working.
       const bearer = (req.headers.authorization || '').replace(/^Bearer /, '');
       const o = unsign(bearer || u.searchParams.get('token'));
-      const valid = !!(o && o.email && await accountAllowed(o.email));
+      const valid = !!(o && o.email && await accountAllowed(o.email, o.accountId || null));
       if (valid) void recordSeen(o.email, clientIp(req));
       res.writeHead(valid ? 200 : 401, { 'Content-Type': 'application/json', ...cors() });
       return res.end(JSON.stringify(valid ? { email: o.email, name: o.name, picture: o.picture } : { error: 'invalid' }));

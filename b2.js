@@ -102,3 +102,34 @@ export async function listKeys(prefix = '', continuationToken = '', maxKeys = 10
   const next = xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/);
   return { keys, truncated: /<IsTruncated>true<\/IsTruncated>/i.test(xml), nextToken: next ? unxml(next[1]) : '' };
 }
+
+
+/** Enumerate every S3 object version and delete marker below a prefix. */
+export async function listObjectVersions(prefix = '', keyMarker = '', versionIdMarker = '', maxKeys = 1000) {
+  const params = new URLSearchParams();
+  params.set('versions', '');
+  params.set('max-keys', String(Math.max(1, Math.min(1000, Math.floor(maxKeys) || 1000))));
+  if (prefix) params.set('prefix', prefix);
+  if (keyMarker) params.set('key-marker', keyMarker);
+  if (versionIdMarker) params.set('version-id-marker', versionIdMarker);
+  const response = await request('GET', '', null, params);
+  if (!response.ok) throw new Error('B2 LIST VERSIONS ' + response.status);
+  const xml = await response.text();
+  const decode = value => value.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))).replace(/&#x([\da-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)));
+  const versions = [];
+  for (const match of xml.matchAll(/<(Version|DeleteMarker)>([\s\S]*?)<\/\1>/g)) {
+    const block = match[2];
+    const value = tag => { const found = block.match(new RegExp('<' + tag + '>([\\s\\S]*?)<\\/' + tag + '>')); return found ? decode(found[1]) : ''; };
+    const key = value('Key'), versionId = value('VersionId');
+    if (key && versionId) versions.push({ key, versionId, deleteMarker: match[1] === 'DeleteMarker', isLatest: value('IsLatest') === 'true' });
+  }
+  const marker = tag => { const found = xml.match(new RegExp('<' + tag + '>([\\s\\S]*?)<\\/' + tag + '>')); return found ? decode(found[1]) : ''; };
+  return { versions, truncated: /<IsTruncated>true<\/IsTruncated>/i.test(xml), nextKeyMarker: marker('NextKeyMarker'), nextVersionIdMarker: marker('NextVersionIdMarker') };
+}
+
+/** Permanently remove one exact object version or delete marker. */
+export async function deleteObjectVersion(key, versionId) {
+  if (!key || !versionId) throw new Error('A key and version ID are required for version deletion.');
+  const response = await request('DELETE', key, null, new URLSearchParams({ versionId }));
+  if (!response.ok && response.status !== 404) throw new Error('B2 DELETE VERSION ' + response.status);
+}
