@@ -1797,11 +1797,11 @@ async function handleIntel(req, res, u) {
       intel = { ...intel, enabled: true, consentAt: intel.consentAt || now, adultConfirmedAt: account.personalIntelAdultConfirmedAt, discoveryPending: true };
       await saveIntel(email, intel);
     }
-    // Older opt-ins predate the adult-only safeguard. Require a fresh explicit opt-in.
-    if (intel.enabled && !intel.adultConfirmedAt) {
+    // A missing account-level opt-in or adult confirmation always overrides a stale profile object.
+    if (intel.enabled && (account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt || !intel.adultConfirmedAt)) {
       intel.enabled = false; intel.discoveryPending = false;
       await saveIntel(email, intel);
-      if (account) {
+      if (account && (account.personalIntelOptIn === true || account.personalIntelAdultConfirmedAt)) {
         const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
         await putJson(userKey(email), accountRest);
       }
@@ -1844,7 +1844,7 @@ async function handleIntel(req, res, u) {
     }
     if (path === '/api/intel/discover' && req.method === 'POST') {
       if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified.' });
-      if (!intel.enabled) return json(res, 403, { code: 'not_enabled', error: 'Turn on Personal Intelligence discovery first.' });
+      if (!intel.enabled || account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt) return json(res, 403, { code: 'not_enabled', error: 'Turn on Personal Intelligence discovery first.' });
       if (!intel.adultConfirmedAt) return json(res, 403, { code: 'adult_confirmation_required', error: 'Confirm that you are 18 or older before discovery can run.' });
       const last = intelRuns.get(email) || 0;
       if (Date.now() - last < 10 * 60e3) return json(res, 429, { code: 'rate_limited', error: 'Discovery can run once every 10 minutes.' });
