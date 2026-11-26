@@ -124,6 +124,7 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/intel`, { headers: { Authorization: 'Bearer ' + passwordSession.token } });
   intelState = await response.json();
   assert.equal(intelState.emailVerified, false);
+  assert.equal(intelState.signupOptInPending, true, 'the unverified account can see and cancel its saved signup opt-in');
   assert.equal(intelState.enabled, false, 'unverified email/password accounts cannot start discovery');
   response = await fetch(`${base}/api/intel/discover`, { method: 'POST', headers: { Authorization: 'Bearer ' + passwordSession.token, 'Content-Type': 'application/json' }, body: '{}' });
   assert.equal(response.status, 403, 'discovery rejects unverified email/password sessions');
@@ -134,6 +135,12 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   intelState = await response.json();
   assert.equal(intelState.enabled, true, 'the saved opt-in activates after Google verifies the same email');
   assert.equal(intelState.discoveryPending, true);
+  response = await fetch(`${base}/api/intel/consent`, { method: 'POST', headers: { Authorization: 'Bearer ' + passwordGoogleToken, 'Content-Type': 'application/json' }, body: JSON.stringify({ enable: false }) });
+  assert.equal(response.status, 200, 'a verified user can disable discovery');
+  response = await fetch(`${base}/api/intel`, { headers: { Authorization: 'Bearer ' + passwordGoogleToken } });
+  intelState = await response.json();
+  assert.equal(intelState.enabled, false);
+  assert.equal(intelState.signupOptInPending, false);
 
   response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer invalid' } });
   assert.equal(response.status, 401, 'an invalid header token is rejected');
