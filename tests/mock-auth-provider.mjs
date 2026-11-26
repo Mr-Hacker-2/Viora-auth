@@ -9,11 +9,11 @@ globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === 'string' ? input : input.url);
   if (url.hostname === 'oauth2.googleapis.com' && url.pathname === '/token') {
     const body = new URLSearchParams(init.body || '');
-    return Response.json({ access_token: body.get('code') === 'unverified' ? 'test-unverified-access-token' : 'test-google-access-token' });
+    return Response.json({ access_token: body.get('code') === 'unverified' ? 'test-unverified-access-token' : body.get('code') === 'other-user-code' ? 'test-other-access-token' : 'test-google-access-token' });
   }
   if (url.hostname === 'openidconnect.googleapis.com' && url.pathname === '/v1/userinfo') {
     const verified = new Headers(init.headers).get('authorization') !== 'Bearer test-unverified-access-token';
-    return Response.json({ email: process.env.MOCK_USER_EMAIL, email_verified: verified, name: 'Test User', picture: '' });
+    return Response.json({ email: new Headers(init.headers).get('authorization') === 'Bearer test-other-access-token' ? 'other.user@example.com' : process.env.MOCK_USER_EMAIL, email_verified: verified, name: 'Test User', picture: '' });
   }
   if (url.hostname === '127.0.0.1' && url.port === process.env.MOCK_B2_PORT) {
     const key = decodeURIComponent(url.pathname.split('/').slice(2).join('/'));
