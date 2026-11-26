@@ -25,7 +25,7 @@ test('website OAuth requires explicit sign-up and verifies account state after G
       GOOGLE_CLIENT_ID: 'test-client', GOOGLE_CLIENT_SECRET: 'test-secret', TOKEN_SECRET: 'integration-test-secret',
       B2_KEY_ID: 'test-key', B2_APP_KEY: 'test-app-key', B2_BUCKET: 'viora-test',
       B2_ENDPOINT: `http://127.0.0.1:${b2Port}`, B2_REGION: 'us-east-005', MOCK_B2_PORT: String(b2Port),
-      MOCK_USER_EMAIL: 'new.user@example.com'
+      MOCK_USER_EMAIL: 'new.user@example.com', ADMIN_EMAILS: 'new.user@example.com'
     }
   });
   t.after(() => child.kill());
@@ -105,6 +105,22 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(response.status, 401, 'an old session cannot access the newly created account');
   response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer ' + freshToken } });
   assert.equal(response.status, 200, 'the fresh account has its own valid session');
+
+  const adminHeaders = { Authorization: 'Bearer ' + freshToken, 'Content-Type': 'application/json' };
+  response = await fetch(`${base}/api/admin/storage/summary`, { headers: adminHeaders });
+  assert.equal(response.status, 200, 'storage summary is protected but available to a server-authorized admin');
+  const storageSummary = await response.json();
+  assert.equal(storageSummary.bucket.bucket, 'viora-test');
+  response = await fetch(`${base}/api/admin/storage/objects?category=all&limit=10`, { headers: adminHeaders });
+  assert.equal(response.status, 200, 'admin can browse paginated storage objects');
+  response = await fetch(`${base}/api/admin/storage/preview`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ scope: 'all' }) });
+  assert.equal(response.status, 200, 'admin can generate a non-destructive bulk deletion preview');
+  const storagePreview = await response.json();
+  assert.equal(storagePreview.objectCount, 0, 'the test account record is protected from bulk deletion');
+  response = await fetch(`${base}/api/admin/storage/delete`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ planId: storagePreview.planId, confirmation: 'DELETE ALL VIORA STORAGE', secondConfirm: false }) });
+  assert.equal(response.status, 400, 'storage deletion requires both confirmations');
+  response = await fetch(`${base}/api/admin/storage/summary`);
+  assert.equal(response.status, 401, 'storage administration rejects unauthenticated requests');
 
   response = await fetch(`${base}/api/admin/users`);
   assert.equal(response.status, 401, 'admin API rejects unauthenticated requests');
