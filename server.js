@@ -1833,6 +1833,7 @@ async function handleIntel(req, res, u) {
        }
        intel.autoApproveStrong = body.autoApproveStrong;
        if (intel.autoApproveStrong) intel = autoApproveStrong(intel);
+       else if (account?.personalIntelAutoApproveStrong === true) { const { personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account; await putJson(userKey(email), accountRest); account = accountRest; }
        await saveIntel(email, intel);
        return json(res, 200, intelView(intel, verified, account));
      }
@@ -1847,7 +1848,7 @@ async function handleIntel(req, res, u) {
       } else {
         intel = { ...intel, enabled: false, autoApproveStrong: false, discoveryPending: false };
         if (account) {
-          const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
+          const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account;
           await putJson(userKey(email), accountRest);
           account = accountRest;
         }
