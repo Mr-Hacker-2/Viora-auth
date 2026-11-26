@@ -203,7 +203,7 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/admin/storage/preview`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ scope: 'all' }) });
   assert.equal(response.status, 200, 'admin can generate a non-destructive bulk deletion preview');
   const storagePreview = await response.json();
-  assert.equal(storagePreview.objectCount, 0, 'the test account record is protected from bulk deletion');
+  assert.equal(storagePreview.objectCount, 1, 'only the explicitly deletable pending Personal Intelligence object is in scope; user account records remain protected');
   response = await fetch(`${base}/api/admin/storage/delete`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ planId: storagePreview.planId, confirmation: 'DELETE ALL VIORA STORAGE', secondConfirm: false }) });
   assert.equal(response.status, 400, 'storage deletion requires both confirmations');
   response = await fetch(`${base}/api/admin/storage/summary`);
