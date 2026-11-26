@@ -15,6 +15,17 @@ globalThis.fetch = async (input, init = {}) => {
     const verified = new Headers(init.headers).get('authorization') !== 'Bearer test-unverified-access-token';
     return Response.json({ email: new Headers(init.headers).get('authorization') === 'Bearer test-other-access-token' ? 'other.user@example.com' : new Headers(init.headers).get('authorization') === 'Bearer test-intel-password-access-token' ? 'pending.email@example.com' : process.env.MOCK_USER_EMAIL, email_verified: verified, name: 'Test User', picture: '' });
   }
+  if (url.hostname === 'api.github.com' && url.pathname === '/search/users') {
+    return Response.json({ items: [{ login: 'mock-strong' }, { login: 'mock-possible' }] });
+  }
+  if (url.hostname === 'api.github.com' && url.pathname === '/users/mock-strong') {
+    return Response.json({ login: 'mock-strong', name: 'Mock Strong', email: process.env.MOCK_USER_EMAIL, html_url: 'https://github.com/mock-strong', bio: 'Mock API test profile', public_repos: 0 });
+  }
+  if (url.hostname === 'api.github.com' && url.pathname === '/users/mock-possible') {
+    return Response.json({ login: 'mock-possible', name: 'Mock Possible', email: null, html_url: 'https://github.com/mock-possible', bio: 'Not verified', public_repos: 0 });
+  }
+  if (url.hostname === 'api.github.com' && url.pathname.endsWith('/repos')) return Response.json([]);
+  if (url.hostname === 'api.gravatar.com') return new Response('', { status: 404 });
   if (url.hostname === '127.0.0.1' && url.port === process.env.MOCK_B2_PORT) {
     const key = decodeURIComponent(url.pathname.split('/').slice(2).join('/'));
     const method = init.method || 'GET';
