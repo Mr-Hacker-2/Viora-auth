@@ -1,5 +1,9 @@
 const realFetch = globalThis.fetch;
-const objects = new Map();\nconst versions = new Map();\nlet nextVersion = 1;\nconst xml = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nfunction putVersion(key, value, deleteMarker = false) { const list = versions.get(key) || []; list.push({ id: 'v' + nextVersion++, value, deleteMarker }); versions.set(key, list); if (deleteMarker) objects.delete(key); else objects.set(key, value); }
+const objects = new Map();
+const versions = new Map();
+let nextVersion = 1;
+const xml = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function putVersion(key, value, deleteMarker = false) { const list = versions.get(key) || []; list.push({ id: 'v' + nextVersion++, value, deleteMarker }); versions.set(key, list); if (deleteMarker) objects.delete(key); else objects.set(key, value); }
 
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === 'string' ? input : input.url);
