@@ -116,7 +116,7 @@ export async function searchGitHub(email, { fetchImpl = fetch, token = process.e
     findings.push({
       source: 'GitHub', url: u.html_url, title: `${u.name || u.login} (@${u.login}) on GitHub`,
       snippet: [u.bio, u.location, `${u.public_repos} public repositories`].filter(Boolean).join(' · '),
-      matchBasis: publicEmailMatches ? 'The profile lists your email address publicly.' : 'GitHub search matched your email, but it is not shown on the profile.',
+      matchBasis: publicEmailMatches ? 'The profile publicly lists your exact email address. This is a strong link, not proof of identity; confirm it belongs to you.' : 'GitHub search matched your email, but it is not shown on the profile; this may be someone else.',
       confidence: publicEmailMatches ? 'strong' : 'possible', facts
     });
   }
@@ -134,11 +134,11 @@ export async function searchGravatar(email, { fetchImpl = fetch, apiKey = proces
   if (p.description) facts.push({ category: 'interests', text: p.description });
   for (const i of (p.interests || []).slice(0, 10)) facts.push({ category: 'interests', text: i.name || i });
   const findings = [];
-  if (p.profile_url) findings.push({ source: 'Gravatar', url: p.profile_url, title: `${p.display_name || 'Gravatar profile'} on Gravatar`, snippet: [p.job_title, p.location, p.description].filter(Boolean).join(' · '), matchBasis: 'Gravatar profiles are created by the owner of this exact email address.', confidence: 'strong', facts });
+  if (p.profile_url) findings.push({ source: 'Gravatar', url: p.profile_url, title: `${p.display_name || 'Gravatar profile'} on Gravatar`, snippet: [p.job_title, p.location, p.description].filter(Boolean).join(' · '), matchBasis: 'This public profile is associated with the hash of your email. That is a strong email-linked signal, not proof that every profile detail is yours.', confidence: 'strong', facts });
   // Accounts the person linked and Gravatar verified — still shown separately so the user approves each one.
   for (const a of (p.verified_accounts || []).slice(0, 10)) {
     if (!httpsUrl(a.url)) continue;
-    findings.push({ source: clip(a.service_label || a.service_type || 'Linked account', 40), url: a.url, title: `${a.service_label || a.service_type} account linked from Gravatar`, snippet: '', matchBasis: 'Linked and verified on the Gravatar profile for your email.', confidence: 'strong', facts: [] });
+    findings.push({ source: clip(a.service_label || a.service_type || 'Linked account', 40), url: a.url, title: `${a.service_label || a.service_type} account linked from Gravatar`, snippet: '', matchBasis: 'Gravatar marks this account as a verified link from the profile associated with your email. Confirm that the linked account belongs to you.', confidence: 'strong', facts: [] });
   }
   for (const l of (p.links || []).slice(0, 10)) {
     if (!httpsUrl(l.url)) continue;
