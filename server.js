@@ -1788,7 +1788,7 @@ async function handleIntel(req, res, u) {
   // Everything below is keyed by the signed-in account's own email. No route accepts another account's id or email.
   const email = user.email, path = u.pathname.replace(/\/+$/, '');
   try {
-    const account = await getJson(userKey(email));
+    let account = await getJson(userKey(email));
     const verified = account?.emailVerified === true;
     let intel = cleanIntel(await getJson(intelKey(email)));
     // Recover a saved signup opt-in if writing the initial intelligence object failed during OAuth.
@@ -1804,6 +1804,7 @@ async function handleIntel(req, res, u) {
       if (account && (account.personalIntelOptIn === true || account.personalIntelAdultConfirmedAt)) {
         const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
         await putJson(userKey(email), accountRest);
+        account = accountRest;
       }
     }
     if (req.method === 'GET' && path === '/api/intel') return json(res, 200, intelView(intel, verified, account));
@@ -1811,6 +1812,7 @@ async function handleIntel(req, res, u) {
       if (account) {
         const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
         await putJson(userKey(email), accountRest);
+        account = accountRest;
       }
       // Disable AI use before attempting the permanent version purge. If deletion fails,
       // the user sees an error and can retry, but the old profile is not used meanwhile.
@@ -1831,16 +1833,17 @@ async function handleIntel(req, res, u) {
         if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified (for example by signing in with Google).' });
         const now = new Date().toISOString();
         intel = { ...intel, enabled: true, consentAt: now, adultConfirmedAt: now, discoveryPending: true };
-        if (account) await putJson(userKey(email), { ...account, personalIntelOptIn: true, personalIntelAdultConfirmedAt: now });
+        if (account) { account = { ...account, personalIntelOptIn: true, personalIntelAdultConfirmedAt: now }; await putJson(userKey(email), account); }
       } else {
         intel = { ...intel, enabled: false, discoveryPending: false };
         if (account) {
           const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
           await putJson(userKey(email), accountRest);
+          account = accountRest;
         }
       }
       await saveIntel(email, intel);
-      return json(res, 200, intelView(intel, verified));
+      return json(res, 200, intelView(intel, verified, account));
     }
     if (path === '/api/intel/discover' && req.method === 'POST') {
       if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified.' });
