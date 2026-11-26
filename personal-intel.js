@@ -23,7 +23,7 @@ export const intelKey = email => `intel/${sha256(email)}.json`;
 const findingId = (source, url) => crypto.createHash('sha256').update(source + '|' + url).digest('hex').slice(0, 16);
 
 export function emptyIntel() {
-  return { version: 1, enabled: false, consentAt: null, adultConfirmedAt: null, discoveryPending: false, lastRunAt: null, lastRunReport: null, findings: [], profile: Object.fromEntries(CATEGORIES.map(c => [c, []])) };
+  return { version: 1, enabled: false, autoApproveStrong: false, consentAt: null, adultConfirmedAt: null, discoveryPending: false, lastRunAt: null, lastRunReport: null, findings: [], profile: Object.fromEntries(CATEGORIES.map(c => [c, []])), factSources: [] };
 }
 
 /** Normalise stored or user-sent data so nothing unexpected survives a round trip. */
@@ -31,6 +31,8 @@ export function cleanIntel(raw) {
   const out = emptyIntel();
   if (!raw || typeof raw !== 'object') return out;
   out.enabled = raw.enabled === true;
+  out.autoApproveStrong = raw.autoApproveStrong === true && out.enabled;
+  out.factSources = Array.isArray(raw.factSources) ? raw.factSources.slice(0, 2000).map(x => ({ category: CATEGORIES.includes(x?.category) ? x.category : 'topics', text: clip(x?.text), findingIds: Array.isArray(x?.findingIds) ? [...new Set(x.findingIds.filter(id => /^[a-f0-9]{16}$/.test(id)))].slice(0, MAX_FINDINGS) : [] })).filter(x => x.text && x.findingIds.length) : [];
   out.consentAt = typeof raw.consentAt === 'string' ? raw.consentAt : null;
   out.adultConfirmedAt = typeof raw.adultConfirmedAt === 'string' ? raw.adultConfirmedAt : null;
   out.discoveryPending = raw.discoveryPending === true;
@@ -51,7 +53,8 @@ function cleanFinding(f) {
     confidence: ['strong', 'possible', 'uncertain'].includes(f.confidence) ? f.confidence : 'uncertain',
     status: ['pending', 'approved', 'rejected'].includes(f.status) ? f.status : 'pending',
     facts: Array.isArray(f.facts) ? f.facts.slice(0, 20).map(x => ({ category: CATEGORIES.includes(x?.category) ? x.category : 'topics', text: clip(x?.text, MAX_TEXT) })).filter(x => x.text) : [],
-    foundAt: typeof f.foundAt === 'string' ? f.foundAt : new Date().toISOString()
+    foundAt: typeof f.foundAt === 'string' ? f.foundAt : new Date().toISOString(),
+    autoApproved: f.autoApproved === true && f.status === 'approved'
   };
 }
 
@@ -71,21 +74,69 @@ export function mergeFindings(existing, incoming) {
     const f = cleanFinding(raw);
     if (!f) continue;
     const old = byId.get(f.id);
-    byId.set(f.id, old ? { ...f, status: old.status, foundAt: old.foundAt } : f);
+    byId.set(f.id, old ? { ...f, status: old.status, foundAt: old.foundAt, autoApproved: old.autoApproved === true && old.status === 'approved' } : f);
   }
   return [...byId.values()].slice(0, MAX_FINDINGS);
 }
 
-/** Approving a finding adds its facts to the profile (deduplicated). Rejecting never removes user-edited items. */
+function factKey(category, text) { return category + '|' + String(text).toLowerCase(); }
+function addFindingFacts(intel, finding) {
+  for (const fact of finding.facts || []) {
+    const list = intel.profile[fact.category], key = factKey(fact.category, fact.text);
+    const tracked = intel.factSources.find(x => factKey(x.category, x.text) === key);
+    if (tracked) {
+      if (!list.some(x => x.toLowerCase() === fact.text.toLowerCase()) && list.length < MAX_ITEMS) list.push(fact.text);
+      if (!tracked.findingIds.includes(finding.id)) tracked.findingIds.push(finding.id);
+      continue;
+    }
+    if (!list.some(x => x.toLowerCase() === fact.text.toLowerCase()) && list.length < MAX_ITEMS) {
+      list.push(fact.text);
+      intel.factSources.push({ category: fact.category, text: fact.text, findingIds: [finding.id] });
+    }
+  }
+}
+function removeFindingFacts(intel, finding) {
+  for (const fact of finding.facts || []) {
+    const key = factKey(fact.category, fact.text);
+    const tracked = intel.factSources.find(x => factKey(x.category, x.text) === key);
+    if (!tracked) continue; // Never remove an untracked, possibly user-entered detail.
+    tracked.findingIds = tracked.findingIds.filter(id => id !== finding.id);
+    if (!tracked.findingIds.length) {
+      intel.profile[fact.category] = (intel.profile[fact.category] || []).filter(x => x.toLowerCase() !== fact.text.toLowerCase());
+      intel.factSources = intel.factSources.filter(x => x !== tracked);
+    }
+  }
+}
+
+/** Pure server-side transform: only strong, pending findings are automatically approved. */
+export function autoApproveStrong(intel) {
+  const next = { ...intel, findings: intel.findings.map(f => ({ ...f })), profile: Object.fromEntries(CATEGORIES.map(c => [c, [...(intel.profile?.[c] || [])]])), factSources: (intel.factSources || []).map(x => ({ ...x, findingIds: [...x.findingIds] })) };
+  for (const finding of next.findings) {
+    if (finding.confidence !== 'strong' || finding.status !== 'pending') continue;
+    finding.status = 'approved';
+    finding.autoApproved = true;
+    addFindingFacts(next, finding);
+  }
+  return next;
+}
+
+/** Manual decisions clear the automatic marker; undo/reject removes facts this finding supplied. */
 export function applyApproval(intel, id, status) {
   const f = intel.findings.find(x => x.id === id);
   if (!f) return null;
+  if (f.status === 'approved' && status !== 'approved') removeFindingFacts(intel, f);
   f.status = status;
-  if (status === 'approved') for (const fact of f.facts) {
-    const list = intel.profile[fact.category];
-    if (!list.some(x => x.toLowerCase() === fact.text.toLowerCase()) && list.length < MAX_ITEMS) list.push(fact.text);
-  }
+  f.autoApproved = false;
+  if (status === 'approved') addFindingFacts(intel, f);
   return intel;
+}
+
+export function removeFinding(intel, id) {
+  const index = intel.findings.findIndex(x => x.id === id);
+  if (index < 0) return false;
+  const [finding] = intel.findings.splice(index, 1);
+  if (finding.status === 'approved') removeFindingFacts(intel, finding);
+  return true;
 }
 
 /* ---------------- source adapters ---------------- */
