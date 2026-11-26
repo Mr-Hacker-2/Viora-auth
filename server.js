@@ -1753,7 +1753,7 @@ async function cachedIntel(email) {
   return intel;
 }
 const saveIntel = async (email, intel) => { await putJson(intelKey(email), intel); intelCache.set(email, { intel, at: Date.now() }); };
-const intelView = (intel, verified) => ({ ...intel, emailVerified: verified, categories: CATEGORIES.map(id => ({ id, label: CATEGORY_LABELS[id] })), sources: INTEL_SOURCES.map(s => ({ id: s.id, label: s.label, configured: s.configured(), note: s.note() })) });
+const intelView = (intel, verified, account = null) => ({ ...intel, emailVerified: verified, signupOptInPending: !verified && account?.personalIntelOptIn === true && typeof account.personalIntelAdultConfirmedAt === 'string', categories: CATEGORIES.map(id => ({ id, label: CATEGORY_LABELS[id] })), sources: INTEL_SOURCES.map(s => ({ id: s.id, label: s.label, configured: s.configured(), note: s.note() })) });
 async function deleteIntelStorageVersions(email) {
   const key = intelKey(email), versions = [];
   let keyMarker = '', versionIdMarker = '';
@@ -1806,7 +1806,7 @@ async function handleIntel(req, res, u) {
         await putJson(userKey(email), accountRest);
       }
     }
-    if (req.method === 'GET' && path === '/api/intel') return json(res, 200, intelView(intel, verified));
+    if (req.method === 'GET' && path === '/api/intel') return json(res, 200, intelView(intel, verified, account));
     if (req.method === 'DELETE' && path === '/api/intel') {
       if (account) {
         const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
