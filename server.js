@@ -1,7 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
-import { b2Ready, getJson, putJson, userKey, listKeys, putObject, getObject, deleteObject, listObjectVersions, deleteObjectVersion } from './b2.js';
+import { b2Ready, getJson, putJson, userKey, listKeys, listObjects, getBucketInfo, putObject, getObject, deleteObject, listObjectVersions, deleteObjectVersion } from './b2.js';
 import { QUESTIONS, cleanAnswers, profileText } from './profile.js';
 import { contextualResearchQuery, heuristicResearchDecision, researchLimits, researchMode, researchReviewRequiresRetry, shouldReviewResearchAnswer } from './research.js';
 import { buildResearchContext, searchWeb } from './web-search.js';
@@ -15,6 +15,7 @@ import { accountFlowDecision } from './auth-flow.js';
 import { clientIp, seenUpdate, cleanLocation, locationPrompt, adminLocation, NO_LOCATION_PROMPT } from './visitor.js';
 import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
 import { handleLabsAdmin, handleLabsPublic } from './labs-cms.js';
+import { createStorageAdmin } from './admin-storage.js';
 import { CATEGORIES, CATEGORY_LABELS, SOURCES as INTEL_SOURCES, applyApproval, cleanIntel, cleanProfile, discover, emptyIntel, intelKey, mergeFindings, relevantContext } from './personal-intel.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
@@ -134,7 +135,7 @@ async function recordSeen(email, ip) {
 }
 
 async function writeAdminAudit(actor, action, target, outcome, details = {}) {
-  if (!b2Ready()) return;
+  if (!b2Ready()) return false;
   const event = {
     at: new Date().toISOString(),
     actor: String(actor || '').slice(0, 254),
@@ -144,9 +145,13 @@ async function writeAdminAudit(actor, action, target, outcome, details = {}) {
     details
   };
   const key = 'admin/audit/' + Date.now() + '_' + crypto.randomUUID() + '.json';
-  try { await putJson(key, event); }
-  catch (error) { console.error('admin audit write failed:', error?.message || error); }
+  try { await putJson(key, event); return true; }
+  catch (error) { console.error('admin audit write failed:', error?.message || error); return false; }
 }
+const storageAdmin = createStorageAdmin({
+  b2Ready, getBucketInfo, listObjects, listObjectVersions, deleteObjectVersion,
+  audit: writeAdminAudit
+});
 async function adminAuth(req) {
   const user = await userOf(req);
   if (!user || !user.email) return { code: 401, error: 'Please sign in again.' };
@@ -763,6 +768,40 @@ async function handleAdmin(req, res, u) {
   const path = u.pathname;
   const labsHandled = await handleLabsAdmin(req, res, u, actor, { b2Ready, getJson, putJson, getObject, putObject, readBody, audit: writeAdminAudit, cors, json: (response, code, data) => { json(response, code, data); return true; } });
   if (labsHandled) return;
+  if (path === '/api/admin/storage/summary' && req.method === 'GET') {
+    try { return json(res, 200, await storageAdmin.summary()); }
+    catch (error) { return json(res, 503, { error: error.message || 'Backblaze storage summary is unavailable.' }); }
+  }
+  if (path === '/api/admin/storage/objects' && req.method === 'GET') {
+    try {
+      return json(res, 200, await storageAdmin.list({
+        category: u.searchParams.get('category') || 'all',
+        prefix: u.searchParams.get('prefix') || '',
+        cursor: u.searchParams.get('cursor') || '',
+        limit: u.searchParams.get('limit') || 100
+      }));
+    } catch (error) { return json(res, 503, { error: error.message || 'Backblaze objects could not be listed.' }); }
+  }
+  if (path === '/api/admin/storage/preview' && req.method === 'POST') {
+    let body;
+    try { body = await readBody(req, 20000); } catch { return json(res, 400, { error: 'Invalid storage deletion preview request.' }); }
+    try {
+      const preview = body.scope === 'all'
+        ? await storageAdmin.previewAll(actor)
+        : body.scope === 'selected'
+          ? await storageAdmin.previewSelected(actor, body.keys)
+          : await storageAdmin.previewCategories(actor, body.categories);
+      return json(res, 200, preview);
+    } catch (error) { return json(res, 400, { error: error.message || 'A safe deletion preview could not be created.' }); }
+  }
+  if (path === '/api/admin/storage/delete' && req.method === 'POST') {
+    let body;
+    try { body = await readBody(req, 5000); } catch { return json(res, 400, { error: 'Invalid storage deletion confirmation.' }); }
+    try {
+      const report = await storageAdmin.execute(actor, body);
+      return json(res, report.success ? 200 : 409, report);
+    } catch (error) { return json(res, 400, { error: error.message || 'Storage deletion could not be completed.' }); }
+  }
   if (req.method === 'GET' && path === '/api/admin/session') {
     return json(res, 200, { ok: true, role: 'admin', email: actor });
   }
@@ -787,10 +826,14 @@ async function handleAdmin(req, res, u) {
       const recentUsers = rows.filter(row => Date.parse(row.lastLoginAt || '') >= now - 30 * day).length;
       const createdToday = rows.filter(row => String(row.createdAt || '').slice(0, 10) === today).length;
       const createdWeek = rows.filter(row => Date.parse(row.createdAt || '') >= now - 7 * day).length;
+      const premiumUsers = rows.filter(row => premiumActive(row)).length;
+      const creditRows = rows.filter(row => Number.isFinite(row.credits));
+      const creditsRemaining = creditRows.reduce((sum, row) => sum + Math.max(0, row.credits), 0);
       return json(res, 200, {
-        users: { total: rows.length, complete: !truncated, newToday: truncated ? null : createdToday, newWeek: truncated ? null : createdWeek, recentSignIns30d: truncated ? null : recentUsers },
+        users: { total: rows.length, complete: !truncated, newToday: truncated ? null : createdToday, newWeek: truncated ? null : createdWeek, recentSignIns30d: truncated ? null : recentUsers, active30d: truncated ? null : recentUsers, premium: truncated ? null : premiumUsers, free: truncated ? null : rows.length - premiumUsers },
+        credits: { accountsWithBalance: truncated ? null : creditRows.length, remainingBalance: truncated ? null : creditsRemaining, usageTracked: false, usageNote: 'Credit consumption events are not persisted by the current service.' },
         ai: { requestsSince: runtimeMetrics.startedAt, submittedRequests: runtimeMetrics.aiRequests, thinkRequests: runtimeMetrics.thinkRequests, byAssistant: runtimeMetrics.byAssistant },
-        unavailable: { conversations: 'Chat histories stay in each user’s browser and are not collected by the server.', uploadedFiles: 'Uploads are processed for a request and are not stored as an admin metric.', estimatedCost: 'Provider billing data is not available to this server.' },
+        unavailable: { conversations: 'Chat histories stay in each user’s browser and are not collected by the server.', uploadedFiles: 'Uploads are processed for a request and are not stored as an admin metric.', estimatedCost: 'Provider billing data is not available to this server.', systemErrors: 'The current server does not persist a searchable admin error feed.' },
         history: truncated ? 'User totals are a lower bound because the account listing reached its safety limit.' : null
       });
     } catch (error) {
