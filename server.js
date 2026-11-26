@@ -2060,6 +2060,7 @@ http.createServer(async (req, res) => {
         const deletedVersions = await deleteAccountStorageVersions(email, digest);
         await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: true, accountId: session.accountId || currentRecord?.accountId || null, deletedVersions, version: 2 });
         intelCache.delete(email);
+        intelRuns.delete(email);
         answerCache.delete(email);
         seenCache.delete(email);
         plannerWriteQueues.delete(email);
