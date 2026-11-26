@@ -104,6 +104,38 @@ export async function listKeys(prefix = '', continuationToken = '', maxKeys = 10
 }
 
 
+/** List current objects with size and upload timestamp for the admin inventory. */
+export async function listObjects(prefix = '', continuationToken = '', maxKeys = 100) {
+  const params = new URLSearchParams();
+  params.set('list-type', '2');
+  params.set('max-keys', String(Math.max(1, Math.min(1000, Math.floor(maxKeys) || 100))));
+  if (prefix) params.set('prefix', prefix);
+  if (continuationToken) params.set('continuation-token', continuationToken);
+  const response = await request('GET', '', null, params);
+  if (!response.ok) throw new Error('B2 LIST OBJECTS ' + response.status);
+  const xml = await response.text();
+  const decode = value => value.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))).replace(/&#x([\da-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)));
+  const objects = [];
+  for (const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+    const block = match[1];
+    const value = tag => { const found = block.match(new RegExp('<' + tag + '>([\\s\\S]*?)<\\/' + tag + '>')); return found ? decode(found[1]) : ''; };
+    const key = value('Key');
+    if (!key) continue;
+    const size = Number(value('Size'));
+    objects.push({ key, size: Number.isFinite(size) && size >= 0 ? size : null, lastModified: value('LastModified') || null, etag: value('ETag') || null, storageClass: value('StorageClass') || null });
+  }
+  const next = xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/);
+  return { objects, truncated: /<IsTruncated>true<\/IsTruncated>/i.test(xml), nextToken: next ? decode(next[1]) : '' };
+}
+
+/** Verify that the configured bucket endpoint is reachable without exposing credentials. */
+export async function getBucketInfo() {
+  if (!b2Ready()) throw new Error('Backblaze B2 is not configured');
+  const response = await request('HEAD', '');
+  if (!response.ok) throw new Error('B2 HEAD BUCKET ' + response.status);
+  return { bucket: B2_BUCKET, endpoint: new URL(ENDPOINT).host, region: REGION, reachable: true };
+}
+
 /** Enumerate every S3 object version and delete marker below a prefix. */
 export async function listObjectVersions(prefix = '', keyMarker = '', versionIdMarker = '', maxKeys = 1000) {
   const params = new URLSearchParams();
@@ -121,7 +153,7 @@ export async function listObjectVersions(prefix = '', keyMarker = '', versionIdM
     const block = match[2];
     const value = tag => { const found = block.match(new RegExp('<' + tag + '>([\\s\\S]*?)<\\/' + tag + '>')); return found ? decode(found[1]) : ''; };
     const key = value('Key'), versionId = value('VersionId');
-    if (key && versionId) versions.push({ key, versionId, deleteMarker: match[1] === 'DeleteMarker', isLatest: value('IsLatest') === 'true' });
+    if (key && versionId) { const size = Number(value('Size')); versions.push({ key, versionId, deleteMarker: match[1] === 'DeleteMarker', isLatest: value('IsLatest') === 'true', size: Number.isFinite(size) && size >= 0 ? size : 0, lastModified: value('LastModified') || null }); }
   }
   const marker = tag => { const found = xml.match(new RegExp('<' + tag + '>([\\s\\S]*?)<\\/' + tag + '>')); return found ? decode(found[1]) : ''; };
   return { versions, truncated: /<IsTruncated>true<\/IsTruncated>/i.test(xml), nextKeyMarker: marker('NextKeyMarker'), nextVersionIdMarker: marker('NextVersionIdMarker') };
