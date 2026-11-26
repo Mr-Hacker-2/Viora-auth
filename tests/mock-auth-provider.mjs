@@ -18,6 +18,7 @@ globalThis.fetch = async (input, init = {}) => {
   if (url.hostname === '127.0.0.1' && url.port === process.env.MOCK_B2_PORT) {
     const key = decodeURIComponent(url.pathname.split('/').slice(2).join('/'));
     const method = init.method || 'GET';
+    if (method === 'HEAD') return new Response(null, { status: 200, headers: { 'x-amz-bucket-region': 'us-east-005' } });
     if (method === 'GET' && url.searchParams.has('versions')) {
       const prefix = url.searchParams.get('prefix') || '';
       const entries = [...versions.entries()].filter(([name]) => name.startsWith(prefix)).flatMap(([name, list]) => list.slice().reverse().map((v, i) => ({ key: name, ...v, latest: i === 0 })));
