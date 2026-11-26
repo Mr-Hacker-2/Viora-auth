@@ -697,6 +697,12 @@ async function handlePasswordAuth(req, res, mode) {
   const key = userKey(email), stamp = new Date().toISOString();
   try {
     const old = await getJson(key);
+    const deletionDigest = crypto.createHash('sha256').update(email).digest('hex');
+    const tombstone = await getJson(`deleted/${deletionDigest}.json`);
+    if (tombstone) {
+      if (mode !== 'signup' || tombstone.deletionComplete !== true) return json(res, 409, { error: 'This account was deleted. Complete a fresh sign-up after deletion has finished.' });
+      await clearCompletedDeletionForSignup(email);
+    }
     if (mode === 'signup') {
       if (body.terms !== true) return json(res, 400, { error: 'Please accept the Terms and Privacy Policy to create your account.' });
       const problem = checkPassword(password);
