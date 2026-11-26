@@ -2,6 +2,7 @@ const realFetch = globalThis.fetch;
 const objects = new Map();
 const versions = new Map();
 let nextVersion = 1;
+let mockIntelFailureResponses = process.env.MOCK_INTEL_FAIL_FIRST_RUN === '1' ? 2 : 0;
 const xml = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 function putVersion(key, value, deleteMarker = false) { const list = versions.get(key) || []; list.push({ id: 'v' + nextVersion++, value, deleteMarker }); versions.set(key, list); if (deleteMarker) objects.delete(key); else objects.set(key, value); }
 
@@ -16,6 +17,7 @@ globalThis.fetch = async (input, init = {}) => {
     return Response.json({ email: new Headers(init.headers).get('authorization') === 'Bearer test-other-access-token' ? 'other.user@example.com' : new Headers(init.headers).get('authorization') === 'Bearer test-intel-password-access-token' ? 'pending.email@example.com' : process.env.MOCK_USER_EMAIL, email_verified: verified, name: 'Test User', picture: '' });
   }
   if (url.hostname === 'api.github.com' && url.pathname === '/search/users') {
+    if (mockIntelFailureResponses > 0) { mockIntelFailureResponses--; return Response.json({ message: 'temporary mock provider outage' }, { status: 503 }); }
     return Response.json({ items: [{ login: 'mock-strong' }, { login: 'mock-possible' }] });
   }
   if (url.hostname === 'api.github.com' && url.pathname === '/users/mock-strong') {
@@ -25,7 +27,7 @@ globalThis.fetch = async (input, init = {}) => {
     return Response.json({ login: 'mock-possible', name: 'Mock Possible', email: null, html_url: 'https://github.com/mock-possible', bio: 'Not verified', public_repos: 0 });
   }
   if (url.hostname === 'api.github.com' && url.pathname.endsWith('/repos')) return Response.json([]);
-  if (url.hostname === 'api.gravatar.com') return new Response('', { status: 404 });
+  if (url.hostname === 'api.gravatar.com') { if (mockIntelFailureResponses > 0) { mockIntelFailureResponses--; return new Response('temporary mock provider outage', { status: 503 }); } return new Response('', { status: 404 }); }
   if (url.hostname === '127.0.0.1' && url.port === process.env.MOCK_B2_PORT) {
     const key = decodeURIComponent(url.pathname.split('/').slice(2).join('/'));
     const method = init.method || 'GET';
