@@ -41,7 +41,7 @@ globalThis.fetch = async (input, init = {}) => {
         const remaining = versions.get(key) || [], latest = remaining[remaining.length - 1];
         if (!latest || latest.deleteMarker) objects.delete(key); else objects.set(key, latest.value);
       } else putVersion(key, null, true);
-      return new Response('', { status: 204 });
+      return new Response(null, { status: 204 });
     }
   }
   return realFetch(input, init);
