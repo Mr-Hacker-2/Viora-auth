@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applyApproval, cleanIntel, discover, emptyIntel, intelKey, mergeFindings, relevantContext, searchBrave, searchGitHub, searchGravatar } from '../personal-intel.js';
+import { applyApproval, autoApproveStrong, cleanIntel, discover, emptyIntel, intelKey, mergeFindings, relevantContext, removeFinding, searchBrave, searchGitHub, searchGravatar } from '../personal-intel.js';
 
 const res = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body });
 
@@ -84,4 +84,35 @@ test('adult confirmation and first-run discovery state are explicit and normalis
   const invalid = cleanIntel({ adultConfirmedAt: 123, discoveryPending: 'yes' });
   assert.equal(invalid.adultConfirmedAt, null);
   assert.equal(invalid.discoveryPending, false);
+});
+
+test('auto approval is pure and only accepts strong pending findings', () => {
+  const intel = emptyIntel(); intel.enabled = true;
+  intel.findings = mergeFindings([], [
+    { source: 'A', url: 'https://a.example/1', confidence: 'strong', facts: [{ category: 'skills', text: 'Rust' }] },
+    { source: 'B', url: 'https://b.example/1', confidence: 'possible', facts: [{ category: 'skills', text: 'Python' }] },
+    { source: 'C', url: 'https://c.example/1', confidence: 'uncertain', facts: [{ category: 'skills', text: 'Go' }] },
+    { source: 'D', url: 'https://d.example/1', confidence: 'strong', status: 'rejected', facts: [{ category: 'skills', text: 'C++' }] }
+  ]);
+  const next = autoApproveStrong(intel);
+  assert.equal(next.findings[0].status, 'approved'); assert.equal(next.findings[0].autoApproved, true);
+  assert.equal(next.findings[1].status, 'pending'); assert.equal(next.findings[2].status, 'pending'); assert.equal(next.findings[3].status, 'rejected');
+  assert.deepEqual(next.profile.skills, ['Rust']); assert.deepEqual(intel.profile.skills, []);
+});
+test('rejecting/deleting an auto-approved finding removes only uniquely supplied facts', () => {
+  const intel = emptyIntel(); intel.enabled = true;
+  intel.findings = mergeFindings([], [
+    { source: 'A', url: 'https://a.example/1', confidence: 'strong', facts: [{ category: 'skills', text: 'Rust' }] },
+    { source: 'B', url: 'https://b.example/1', confidence: 'strong', facts: [{ category: 'skills', text: 'Rust' }, { category: 'skills', text: 'Python' }] }
+  ]);
+  const next = autoApproveStrong(intel);
+  applyApproval(next, next.findings[0].id, 'rejected');
+  assert.equal(next.findings[0].autoApproved, false); assert.deepEqual(next.profile.skills, ['Rust', 'Python']);
+  removeFinding(next, next.findings[1].id); assert.deepEqual(next.profile.skills, []);
+});
+test('manual undo clears autoApproved and removes its tracked facts', () => {
+  const intel = emptyIntel(); intel.enabled = true;
+  intel.findings = mergeFindings([], [{ source: 'A', url: 'https://a.example/1', confidence: 'strong', facts: [{ category: 'skills', text: 'Rust' }] }]);
+  const next = autoApproveStrong(intel); applyApproval(next, next.findings[0].id, 'pending');
+  assert.equal(next.findings[0].autoApproved, false); assert.deepEqual(next.profile.skills, []);
 });
