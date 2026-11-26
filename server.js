@@ -186,12 +186,34 @@ const plannerWriteQueues = new Map();
 const PLANNER_LIMITS = { projects: 100, tasks: 2500, title: 180, text: 8000, comment: 2000 };
 
 const plannerKey = email => userKey(email).replace(/^users\//, 'planner/');
+async function findAccountAuditKeys(email) {
+  const keys = [];
+  let token = '';
+  do {
+    const page = await listKeys('admin/audit/', token, 1000);
+    keys.push(...page.keys);
+    if (keys.length > 100000) throw new Error('too_many_audit_records');
+    token = page.truncated ? page.nextToken : '';
+    if (page.truncated && !token) throw new Error('audit_pagination_failed');
+  } while (token);
+  const matches = [];
+  for (let i = 0; i < keys.length; i += 25) {
+    const rows = await Promise.all(keys.slice(i, i + 25).map(key => getJson(key)));
+    rows.forEach((row, index) => {
+      if (row && (normEmail(row.actor) === email || normEmail(row.target) === email)) matches.push(keys[i + index]);
+    });
+  }
+  return matches;
+}
+
 async function deleteAccountStorageVersions(email, digest) {
+  const auditKeys = await findAccountAuditKeys(email);
   const targets = [
     { prefix: userKey(email), exact: true },
     { prefix: plannerKey(email), exact: true },
     { prefix: intelKey(email), exact: true },
-    { prefix: `planner-files/${digest}/`, exact: false }
+    { prefix: `planner-files/${digest}/`, exact: false },
+    ...auditKeys.map(key => ({ prefix: key, exact: true }))
   ];
   let total = 0;
   for (const target of targets) {
