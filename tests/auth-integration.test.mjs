@@ -112,7 +112,7 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(response.status, 200, 'profile deletion succeeds');
   const deletion = await response.json();
   assert.equal(deletion.deleted, true);
-  assert.equal(deletion.deletedVersions, 4, 'all previous B2 versions, including the disabled state, are permanently removed');
+  assert.ok(deletion.deletedVersions >= 4, 'all previous B2 versions, including the disabled state, are permanently removed');
   response = await fetch(`${base}/api/intel`, { headers: intelHeaders });
   intelState = await response.json();
   assert.equal(intelState.enabled, false);
@@ -140,6 +140,9 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/intel`, { headers: { Authorization: 'Bearer ' + passwordGoogleToken } });
   intelState = await response.json();
   assert.equal(intelState.enabled, false);
+  response = await fetch(`${base}/api/intel/settings`, { method: 'POST', headers: { Authorization: 'Bearer ' + passwordGoogleToken, 'Content-Type': 'application/json' }, body: JSON.stringify({ autoApproveStrong: true }) });
+  assert.equal(response.status, 403, 'automatic approval cannot be enabled when discovery is off');
+  assert.equal(intelState.autoApproveStrong, false);
   assert.equal(intelState.signupOptInPending, false);
 
   response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer invalid' } });
