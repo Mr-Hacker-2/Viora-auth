@@ -1882,6 +1882,7 @@ async function handleIntel(req, res, u) {
     }
     if (path === '/api/intel/profile' && (req.method === 'PUT' || req.method === 'POST')) {
       intel.profile = cleanProfile(body.profile);
+      intel.factSources = (intel.factSources || []).filter(source => (intel.profile[source.category] || []).some(item => item.toLowerCase() === source.text.toLowerCase()));
       await saveIntel(email, intel);
       return json(res, 200, intelView(intel, verified, account));
     }
