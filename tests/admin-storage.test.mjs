@@ -11,7 +11,8 @@ function fixture({ failDelete = false } = {}) {
     { key: 'labs/tools.json', versionId: 'l1', size: 80, deleteMarker: false },
     { key: 'users/user.json', versionId: 'u1', size: 100, deleteMarker: false },
     { key: 'deleted/hash.json', versionId: 'd1', size: 20, deleteMarker: false },
-    { key: 'admin/audit/event.json', versionId: 'a1', size: 50, deleteMarker: false }
+    { key: 'admin/audit/event.json', versionId: 'a1', size: 50, deleteMarker: false },
+    { key: 'other-app/private.json', versionId: 'x1', size: 77, deleteMarker: false }
   ];
   const auditRows = [];
   const deleted = [];
@@ -50,6 +51,17 @@ test('storage listing paginates and labels protected account objects read-only',
   assert.equal(protectedRows.objects[0].categoryLabel, 'User accounts');
 });
 
+test('storage summary reports real configured bucket metadata and excludes unclassified objects from Viora totals', async () => {
+  const { api } = fixture();
+  const result = await api.summary();
+  assert.equal(result.bucket.bucket, 'viora-private');
+  assert.equal(result.bucket.reachable, true);
+  assert.equal(result.totals.objects, 7);
+  assert.equal(result.totals.versions, 8);
+  assert.equal(result.totals.bytes, 800);
+  assert.equal(result.complete, true);
+});
+
 test('bulk preview scopes deletion to Viora application data and preserves identity and audit namespaces', async () => {
   const { api } = fixture();
   const preview = await api.previewAll('admin@example.com');
@@ -80,6 +92,21 @@ test('bulk deletion removes all versions, verifies the result, and audits the op
   assert.ok(getRows().some(row => row.key.startsWith('users/')));
   assert.ok(getRows().some(row => row.key.startsWith('deleted/')));
   assert.ok(getRows().some(row => row.key.startsWith('admin/audit/')));
+  assert.ok(getRows().some(row => row.key.startsWith('other-app/')));
+});
+
+test('category-scoped deletion can preview only the requested deletable category', async () => {
+  const { api, deleted, getRows } = fixture();
+  const preview = await api.previewCategories('admin@example.com', ['planner']);
+  assert.equal(preview.mode, 'categories');
+  assert.deepEqual(preview.categories.map(item => item.id), ['planner']);
+  assert.equal(preview.objectCount, 1);
+  const result = await api.execute('admin@example.com', { planId: preview.planId, confirmation: 'DELETE SELECTED VIORA CATEGORIES', secondConfirm: true });
+  assert.equal(result.success, true);
+  assert.equal(result.deletedVersions, 2);
+  assert.ok(!getRows().some(row => row.key.startsWith('planner/')));
+  assert.ok(getRows().some(row => row.key.startsWith('planner-files/')));
+  assert.equal(deleted.length, 2);
 });
 
 test('selected deletion refuses protected and unclassified objects', async () => {
