@@ -105,12 +105,12 @@ const accountAuthCache = new Map();
 async function accountAllowed(email, accountId = null) {
   if (!b2Ready()) return true;
   const key = normEmail(email), cached = accountAuthCache.get(key);
-  if (cached && cached.until > Date.now()) return cached.allowed;
+  if (cached && cached.until > Date.now() && cached.accountId === accountId) return cached.allowed;
   const digest = crypto.createHash('sha256').update(key).digest('hex');
   const deleted = await getJson(`deleted/${digest}.json`);
   const record = deleted ? null : await getJson(userKey(key));
   const allowed = !deleted && record?.status !== 'suspended' && (!record?.accountId || accountId === record.accountId);
-  accountAuthCache.set(key, { allowed, until: Date.now() + 10000 });
+  accountAuthCache.set(key, { allowed, accountId, until: Date.now() + 10000 });
   return allowed;
 }
 const userOf = async req => {
