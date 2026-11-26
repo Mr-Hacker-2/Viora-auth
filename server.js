@@ -972,7 +972,8 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
   try {
     const key = userKey(user.email), now = new Date().toISOString();
     const digest = crypto.createHash('sha256').update(normEmail(user.email)).digest('hex');
-    const tombstone = await getJson(`deleted/${digest}.json`);\n    if (tombstone) {\n      if (!(requireSignupConsent && mode === 'signup')) return { authError: 'account_deleted' };\n      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };\n      await clearCompletedDeletionForSignup(user.email);\n    }
+    const tombstone = await getJson(`deleted/${digest}.json`);
+    if (tombstone) {\n      if (!(requireSignupConsent && mode === 'signup')) return { authError: 'account_deleted' };\n      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };\n      await clearCompletedDeletionForSignup(user.email);\n    }
     const old = await getJson(key);
     // Website sign-in may discover account state only after Google has verified
     // ownership of this email. A new profile requires an explicit sign-up choice.
@@ -985,7 +986,8 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
     // can register someone else's address first and keep a way in.
     const { passwordHash: _dropped, ...oldKept } = old || {};
     const rec = {
-      ...(old ? oldKept : { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),\n      accountId: old?.accountId || crypto.randomUUID(),
+      ...(old ? oldKept : { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),
+      accountId: old?.accountId || crypto.randomUUID(),
       emailVerified: true,
       email: user.email, name: user.name, picture: user.picture, provider: 'google',
       ...(requireSignupConsent && mode === 'signup' && termsAccepted ? { termsAcceptedAt: old?.termsAcceptedAt || now } : {}),
@@ -1883,8 +1885,11 @@ http.createServer(async (req, res) => {
       }
       const digest = crypto.createHash('sha256').update(email).digest('hex');
       const tombstoneKey = `deleted/${digest}.json`;
-      const filesPrefix = `planner-files/${digest}/`;
       try {
+        const existingTombstone = await getJson(tombstoneKey);
+        const currentRecord = await getJson(userKey(email));
+        if (existingTombstone?.accountId && session.accountId !== existingTombstone.accountId) return json(res, 401, { error: 'Please sign in with the current account session.' });
+        if (!existingTombstone && currentRecord?.accountId && session.accountId !== currentRecord.accountId) return json(res, 401, { error: 'Please sign in with the current account session.' });
         // The hashed tombstone prevents any still-valid signed session from reopening a deleted account.
         // It contains no email, password, profile, or conversation content.
         await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: false, accountId: session.accountId || currentRecord?.accountId || null, version: 2 });
