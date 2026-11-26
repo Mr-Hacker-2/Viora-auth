@@ -722,7 +722,8 @@ async function handlePasswordAuth(req, res, mode) {
     const ok = await verifyPassword(password, old?.passwordHash || DUMMY_HASH);
     if (!old || !ok) { await writeAdminAudit(email, 'login_password', email, 'denied'); return json(res, 401, { error: 'Incorrect email or password.' }); }
     if (old.status === 'suspended') { await writeAdminAudit(email, 'login_password', email, 'denied', { reason: 'suspended' }); return json(res, 403, { error: 'This account is currently unavailable. Contact Viora support for help.' }); }
-    const accountId = old.accountId || crypto.randomUUID();\n    await putJson(key, { ...old, accountId, lastLoginAt: stamp, logins: (old.logins || 0) + 1 });
+    const accountId = old.accountId || crypto.randomUUID();
+    await putJson(key, { ...old, accountId, lastLoginAt: stamp, logins: (old.logins || 0) + 1 });
     await writeAdminAudit(email, 'login_password', email, 'success');
     passwordAttempts.delete(email);
     return json(res, 200, { token: sign({ email, name: old.name || '', picture: '', accountId, exp: Date.now() + 30 * 864e5 }), email, name: old.name || '', picture: '' });
@@ -975,7 +976,8 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
     const tombstone = await getJson(`deleted/${digest}.json`);
     if (tombstone) {
       if (!(requireSignupConsent && mode === 'signup')) return { authError: 'account_deleted' };
-      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };\n      await clearCompletedDeletionForSignup(user.email);\n    }
+      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };
+      await clearCompletedDeletionForSignup(user.email);\n    }
     const old = await getJson(key);
     // Website sign-in may discover account state only after Google has verified
     // ownership of this email. A new profile requires an explicit sign-up choice.
