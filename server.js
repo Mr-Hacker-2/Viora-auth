@@ -973,7 +973,8 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
     const key = userKey(user.email), now = new Date().toISOString();
     const digest = crypto.createHash('sha256').update(normEmail(user.email)).digest('hex');
     const tombstone = await getJson(`deleted/${digest}.json`);
-    if (tombstone) {\n      if (!(requireSignupConsent && mode === 'signup')) return { authError: 'account_deleted' };\n      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };\n      await clearCompletedDeletionForSignup(user.email);\n    }
+    if (tombstone) {
+      if (!(requireSignupConsent && mode === 'signup')) return { authError: 'account_deleted' };\n      if (tombstone.deletionComplete !== true) return { authError: 'account_deletion_incomplete' };\n      await clearCompletedDeletionForSignup(user.email);\n    }
     const old = await getJson(key);
     // Website sign-in may discover account state only after Google has verified
     // ownership of this email. A new profile requires an explicit sign-up choice.
@@ -1889,13 +1890,13 @@ http.createServer(async (req, res) => {
         const existingTombstone = await getJson(tombstoneKey);
         const currentRecord = await getJson(userKey(email));
         if (existingTombstone?.accountId && session.accountId !== existingTombstone.accountId) return json(res, 401, { error: 'Please sign in with the current account session.' });
-        if (!existingTombstone && currentRecord?.accountId && session.accountId !== currentRecord.accountId) return json(res, 401, { error: 'Please sign in with the current account session.' });
+        if (currentRecord?.accountId && session.accountId !== currentRecord.accountId) return json(res, 401, { error: 'Please sign in with the current account session.' });
         // The hashed tombstone prevents any still-valid signed session from reopening a deleted account.
         // It contains no email, password, profile, or conversation content.
         await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: false, accountId: session.accountId || currentRecord?.accountId || null, version: 2 });
         accountAuthCache.set(email, { allowed: false, until: Date.now() + 60 * 60e3 });
         const deletedVersions = await deleteAccountStorageVersions(email, digest);
-        await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: true, deletedVersions, version: 2 });
+        await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: true, accountId: session.accountId || currentRecord?.accountId || null, deletedVersions, version: 2 });
         intelCache.delete(email);
         answerCache.delete(email);
         seenCache.delete(email);
