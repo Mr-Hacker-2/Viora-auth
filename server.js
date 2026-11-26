@@ -736,8 +736,11 @@ async function handlePasswordAuth(req, res, mode) {
       if (problem) return json(res, 400, { error: problem });
       if (old) return json(res, 409, { error: old.passwordHash ? 'An account with this email already exists. Sign in instead.' : 'This email already has an account. Sign in with Google instead.' });
       const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80) : email.split('@')[0];
+      if (body.personalIntelOptIn === true && body.personalIntelAdultConfirmed !== true) return json(res, 400, { error: 'Personal Intelligence requires a separate confirmation that you are 18 or older.' });
+      const intelOptIn = body.personalIntelOptIn === true && body.personalIntelAdultConfirmed === true;
       const rec = {
         createdAt: stamp, accountId: crypto.randomUUID(), signedUpVia: 'signup', onboarded: false, answers: null, email, name, picture: '', provider: 'password', emailVerified: false,
+        ...(intelOptIn ? { personalIntelOptIn: true, personalIntelAdultConfirmedAt: stamp } : {}),
         passwordHash: await hashPassword(password), termsAcceptedAt: stamp, lastLoginAt: stamp, logins: 1
       };
       await putJson(key, rec);
@@ -1030,7 +1033,7 @@ async function cachedAnswers(email) {
   return answers;
 }
 /** Create the account on first sign-in, or record a returning sign-in. Never blocks login if storage is down. */
-async function recordSignIn(user, mode, { requireSignupConsent = false, termsAccepted = false } = {}) {
+async function recordSignIn(user, mode, { requireSignupConsent = false, termsAccepted = false, personalIntelOptIn = false, personalIntelAdultConfirmed = false } = {}) {
   if (!b2Ready()) {
     console.warn('Backblaze B2 is not configured; accounts are not being saved');
     return requireSignupConsent ? { authError: 'storage_unavailable' } : null;
@@ -1055,15 +1058,25 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
     // Google has proved this person owns the email. A password set up earlier without proof of ownership is dropped, so nobody
     // can register someone else's address first and keep a way in.
     const { passwordHash: _dropped, ...oldKept } = old || {};
+    const optedIntoIntel = (requireSignupConsent && mode === 'signup' && personalIntelOptIn === true && personalIntelAdultConfirmed === true)
+      || (old?.personalIntelOptIn === true && typeof old.personalIntelAdultConfirmedAt === 'string');
     const rec = {
       ...(old ? oldKept : { createdAt: now, signedUpVia: mode === 'signup' ? 'signup' : 'signin', onboarded: false, answers: null }),
       accountId: old?.accountId || crypto.randomUUID(),
       emailVerified: true,
       email: user.email, name: user.name, picture: user.picture, provider: 'google',
+      ...(optedIntoIntel ? { personalIntelOptIn: true, personalIntelAdultConfirmedAt: old?.personalIntelAdultConfirmedAt || now } : {}),
       ...(requireSignupConsent && mode === 'signup' && termsAccepted ? { termsAcceptedAt: old?.termsAcceptedAt || now } : {}),
       lastLoginAt: now, logins: ((old && old.logins) || 0) + 1
     };
     await putJson(key, rec);
+    if (optedIntoIntel) {
+      const priorIntel = cleanIntel(await getJson(intelKey(user.email)));
+      if (!priorIntel.enabled) {
+        await putJson(intelKey(user.email), { ...priorIntel, enabled: true, consentAt: priorIntel.consentAt || now, adultConfirmedAt: priorIntel.adultConfirmedAt || now, discoveryPending: true });
+        intelCache.delete(normEmail(user.email));
+      }
+    }
     await writeAdminAudit(user.email, 'login', user.email, 'success');
     return rec;
   } catch (e) {
@@ -1728,6 +1741,32 @@ async function cachedIntel(email) {
 }
 const saveIntel = async (email, intel) => { await putJson(intelKey(email), intel); intelCache.set(email, { intel, at: Date.now() }); };
 const intelView = (intel, verified) => ({ ...intel, emailVerified: verified, categories: CATEGORIES.map(id => ({ id, label: CATEGORY_LABELS[id] })), sources: INTEL_SOURCES.map(s => ({ id: s.id, label: s.label, configured: s.configured(), note: s.note() })) });
+async function deleteIntelStorageVersions(email) {
+  const key = intelKey(email), versions = [];
+  let keyMarker = '', versionIdMarker = '';
+  do {
+    const page = await listObjectVersions(key, keyMarker, versionIdMarker, 1000);
+    versions.push(...page.versions.filter(item => item.key === key));
+    if (versions.length > 10000) throw new Error('personal_intel_version_limit_exceeded');
+    if (!page.truncated) break;
+    if (!page.nextKeyMarker || !page.nextVersionIdMarker) throw new Error('personal_intel_pagination_failed');
+    keyMarker = page.nextKeyMarker; versionIdMarker = page.nextVersionIdMarker;
+  } while (true);
+  for (let i = 0; i < versions.length; i += 50) {
+    const results = await Promise.allSettled(versions.slice(i, i + 50).map(item => deleteObjectVersion(item.key, item.versionId)));
+    if (results.some(result => result.status === 'rejected')) throw new Error('personal_intel_version_delete_failed');
+  }
+  let verifyKey = '', verifyVersion = '';
+  do {
+    const page = await listObjectVersions(key, verifyKey, verifyVersion, 1000);
+    if (page.versions.some(item => item.key === key)) throw new Error('personal_intel_delete_verification_failed');
+    if (!page.truncated) break;
+    if (!page.nextKeyMarker || !page.nextVersionIdMarker) throw new Error('personal_intel_verification_pagination_failed');
+    verifyKey = page.nextKeyMarker; verifyVersion = page.nextVersionIdMarker;
+  } while (true);
+  return versions.length;
+}
+
 async function handleIntel(req, res, u) {
   const user = await userOf(req);
   if (!user) return json(res, 401, { error: 'Please sign in again.' });
@@ -1739,10 +1778,24 @@ async function handleIntel(req, res, u) {
     const account = await getJson(userKey(email));
     const verified = account?.emailVerified === true;
     let intel = cleanIntel(await getJson(intelKey(email)));
+    // Older opt-ins predate the adult-only safeguard. Require a fresh explicit opt-in.
+    if (intel.enabled && !intel.adultConfirmedAt) {
+      intel.enabled = false; intel.discoveryPending = false;
+      await saveIntel(email, intel);
+      if (account) {
+        const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
+        await putJson(userKey(email), accountRest);
+      }
+    }
     if (req.method === 'GET' && path === '/api/intel') return json(res, 200, intelView(intel, verified));
     if (req.method === 'DELETE' && path === '/api/intel') {
-      await deleteObject(intelKey(email)); intelCache.delete(email); intelRuns.delete(email);
-      return json(res, 200, { ok: true, deleted: true });
+      const deletedVersions = await deleteIntelStorageVersions(email);
+      if (account) {
+        const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
+        await putJson(userKey(email), accountRest);
+      }
+      intelCache.delete(email); intelRuns.delete(email);
+      return json(res, 200, { ok: true, deleted: true, deletedVersions });
     }
     if (req.method !== 'POST' && req.method !== 'PUT' && req.method !== 'DELETE') return json(res, 405, { error: 'Method not allowed.' });
     let body = {};
@@ -1750,20 +1803,30 @@ async function handleIntel(req, res, u) {
     if (path === '/api/intel/consent') {
       if (body.enable === true) {
         if (body.acknowledge !== true) return json(res, 400, { error: 'Please confirm you understand what will be searched.' });
+        if (body.adultConfirmed !== true) return json(res, 400, { code: 'adult_confirmation_required', error: 'Personal Intelligence discovery is available only to people who confirm they are 18 or older.' });
         if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified (for example by signing in with Google).' });
-        intel = { ...intel, enabled: true, consentAt: new Date().toISOString() };
-      } else intel = { ...intel, enabled: false };
+        const now = new Date().toISOString();
+        intel = { ...intel, enabled: true, consentAt: now, adultConfirmedAt: now, discoveryPending: true };
+        if (account) await putJson(userKey(email), { ...account, personalIntelOptIn: true, personalIntelAdultConfirmedAt: now });
+      } else {
+        intel = { ...intel, enabled: false, discoveryPending: false };
+        if (account) {
+          const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
+          await putJson(userKey(email), accountRest);
+        }
+      }
       await saveIntel(email, intel);
       return json(res, 200, intelView(intel, verified));
     }
     if (path === '/api/intel/discover' && req.method === 'POST') {
       if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified.' });
       if (!intel.enabled) return json(res, 403, { code: 'not_enabled', error: 'Turn on Personal Intelligence discovery first.' });
+      if (!intel.adultConfirmedAt) return json(res, 403, { code: 'adult_confirmation_required', error: 'Confirm that you are 18 or older before discovery can run.' });
       const last = intelRuns.get(email) || 0;
       if (Date.now() - last < 10 * 60e3) return json(res, 429, { code: 'rate_limited', error: 'Discovery can run once every 10 minutes.' });
       intelRuns.set(email, Date.now());
       const { findings, report } = await discover(email);
-      intel = { ...intel, findings: mergeFindings(intel.findings, findings), lastRunAt: new Date().toISOString(), lastRunReport: report };
+      intel = { ...intel, findings: mergeFindings(intel.findings, findings), discoveryPending: false, lastRunAt: new Date().toISOString(), lastRunReport: report };
       intel = cleanIntel(intel);
       await saveIntel(email, intel);
       return json(res, 200, intelView(intel, verified));
@@ -1853,7 +1916,10 @@ http.createServer(async (req, res) => {
       if (site && mode === 'signup' && !termsAccepted) { res.writeHead(400); return res.end('Accept the Terms and Privacy Policy before creating an account.'); }
       const email = normEmail(u.searchParams.get('email'));
       if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { res.writeHead(400); return res.end('Enter a valid email address.'); }
-      const state = sign({ ext, site, mode, email, termsAccepted, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
+      const personalIntelOptIn = site && mode === 'signup' && u.searchParams.get('intel') === '1';
+      const personalIntelAdultConfirmed = site && mode === 'signup' && u.searchParams.get('intel_adult') === '1';
+      if (personalIntelOptIn && !personalIntelAdultConfirmed) { res.writeHead(400); return res.end('Personal Intelligence requires a separate confirmation that you are 18 or older.'); }
+      const state = sign({ ext, site, mode, email, termsAccepted, personalIntelOptIn, personalIntelAdultConfirmed, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
       const params = new URLSearchParams({
         client_id: GOOGLE_CLIENT_ID, redirect_uri: REDIRECT, response_type: 'code',
         scope: 'openid email profile', state, prompt: 'select_account'
@@ -1884,7 +1950,7 @@ http.createServer(async (req, res) => {
       })).json();
       if (!info.email || !info.email_verified) return back(res, st, { error: 'unverified_email' });
       const user = { email: info.email, name: info.name || '', picture: info.picture || '' };
-      const account = await recordSignIn(user, st.mode, { requireSignupConsent: !!st.site, termsAccepted: !!st.termsAccepted });
+      const account = await recordSignIn(user, st.mode, { requireSignupConsent: !!st.site, termsAccepted: !!st.termsAccepted, personalIntelOptIn: st.personalIntelOptIn === true, personalIntelAdultConfirmed: st.personalIntelAdultConfirmed === true });
       if (account?.authError) return back(res, account.authError === 'account_not_found' ? { ...st, email: normEmail(user.email) } : st, { error: account.authError });
       if (account?.status === 'suspended') return back(res, st, { error: 'account_suspended' });
       return back(res, st, { token: sign({ ...user, accountId: account.accountId, exp: Date.now() + 30 * 864e5 }), ...user });
