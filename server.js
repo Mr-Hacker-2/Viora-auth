@@ -16,7 +16,7 @@ import { clientIp, seenUpdate, cleanLocation, locationPrompt, adminLocation, NO_
 import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
 import { handleLabsAdmin, handleLabsPublic } from './labs-cms.js';
 import { createStorageAdmin } from './admin-storage.js';
-import { CATEGORIES, CATEGORY_LABELS, SOURCES as INTEL_SOURCES, applyApproval, cleanIntel, cleanProfile, discover, emptyIntel, intelKey, mergeFindings, relevantContext } from './personal-intel.js';
+import { CATEGORIES, CATEGORY_LABELS, SOURCES as INTEL_SOURCES, applyApproval, autoApproveStrong, cleanIntel, cleanProfile, discover, emptyIntel, intelKey, mergeFindings, relevantContext, removeFinding } from './personal-intel.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
 const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
@@ -740,7 +740,7 @@ async function handlePasswordAuth(req, res, mode) {
       const intelOptIn = body.personalIntelOptIn === true && body.personalIntelAdultConfirmed === true;
       const rec = {
         createdAt: stamp, accountId: crypto.randomUUID(), signedUpVia: 'signup', onboarded: false, answers: null, email, name, picture: '', provider: 'password', emailVerified: false,
-        ...(intelOptIn ? { personalIntelOptIn: true, personalIntelAdultConfirmedAt: stamp } : {}),
+        ...(intelOptIn ? { personalIntelOptIn: true, personalIntelAdultConfirmedAt: stamp, personalIntelAutoApproveStrong: body.personalIntelAutoApproveStrong === true } : {}),
         passwordHash: await hashPassword(password), termsAcceptedAt: stamp, lastLoginAt: stamp, logins: 1
       };
       await putJson(key, rec);
@@ -1033,7 +1033,7 @@ async function cachedAnswers(email) {
   return answers;
 }
 /** Create the account on first sign-in, or record a returning sign-in. Never blocks login if storage is down. */
-async function recordSignIn(user, mode, { requireSignupConsent = false, termsAccepted = false, personalIntelOptIn = false, personalIntelAdultConfirmed = false } = {}) {
+async function recordSignIn(user, mode, { requireSignupConsent = false, termsAccepted = false, personalIntelOptIn = false, personalIntelAdultConfirmed = false, personalIntelAutoApproveStrong = false } = {}) {
   if (!b2Ready()) {
     console.warn('Backblaze B2 is not configured; accounts are not being saved');
     return requireSignupConsent ? { authError: 'storage_unavailable' } : null;
@@ -1074,7 +1074,7 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
       try {
         const priorIntel = cleanIntel(await getJson(intelKey(user.email)));
         if (!priorIntel.enabled) {
-          await putJson(intelKey(user.email), { ...priorIntel, enabled: true, consentAt: priorIntel.consentAt || now, adultConfirmedAt: priorIntel.adultConfirmedAt || rec.personalIntelAdultConfirmedAt || now, discoveryPending: true });
+          await putJson(intelKey(user.email), { ...priorIntel, enabled: true, autoApproveStrong: old?.personalIntelAutoApproveStrong === true || personalIntelAutoApproveStrong === true, consentAt: priorIntel.consentAt || now, adultConfirmedAt: priorIntel.adultConfirmedAt || rec.personalIntelAdultConfirmedAt || now, discoveryPending: true });
           intelCache.delete(normEmail(user.email));
         }
       } catch (error) {
@@ -1748,12 +1748,12 @@ async function cachedIntel(email) {
   }
   const hit = intelCache.get(email);
   if (hit && Date.now() - hit.at < 5 * 60e3) return hit.intel;
-  const intel = cleanIntel(await getJson(intelKey(email)));
+  let intel = cleanIntel(await getJson(intelKey(email)));
   intelCache.set(email, { intel, at: Date.now() });
   return intel;
 }
 const saveIntel = async (email, intel) => { await putJson(intelKey(email), intel); intelCache.set(email, { intel, at: Date.now() }); };
-const intelView = (intel, verified, account = null) => ({ ...intel, emailVerified: verified, signupOptInPending: !verified && account?.personalIntelOptIn === true && typeof account.personalIntelAdultConfirmedAt === 'string', categories: CATEGORIES.map(id => ({ id, label: CATEGORY_LABELS[id] })), sources: INTEL_SOURCES.map(s => ({ id: s.id, label: s.label, configured: s.configured(), note: s.note() })) });
+const intelView = (intel, verified, account = null) => ({ ...intel, autoApproveStrong: intel.autoApproveStrong === true, emailVerified: verified, signupOptInPending: !verified && account?.personalIntelOptIn === true && typeof account.personalIntelAdultConfirmedAt === 'string', categories: CATEGORIES.map(id => ({ id, label: CATEGORY_LABELS[id] })), sources: INTEL_SOURCES.map(s => ({ id: s.id, label: s.label, configured: s.configured(), note: s.note() })) });
 async function deleteIntelStorageVersions(email) {
   const key = intelKey(email), versions = [];
   let keyMarker = '', versionIdMarker = '';
@@ -1794,15 +1794,15 @@ async function handleIntel(req, res, u) {
     // Recover a saved signup opt-in if writing the initial intelligence object failed during OAuth.
     if (verified && account?.personalIntelOptIn === true && typeof account.personalIntelAdultConfirmedAt === 'string' && !intel.adultConfirmedAt) {
       const now = new Date().toISOString();
-      intel = { ...intel, enabled: true, consentAt: intel.consentAt || now, adultConfirmedAt: account.personalIntelAdultConfirmedAt, discoveryPending: true };
+      intel = { ...intel, enabled: true, autoApproveStrong: account.personalIntelAutoApproveStrong === true, consentAt: intel.consentAt || now, adultConfirmedAt: account.personalIntelAdultConfirmedAt, discoveryPending: true };
       await saveIntel(email, intel);
     }
     // A missing account-level opt-in or adult confirmation always overrides a stale profile object.
     if (intel.enabled && (account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt || !intel.adultConfirmedAt)) {
-      intel.enabled = false; intel.discoveryPending = false;
+      intel.enabled = false; intel.autoApproveStrong = false; intel.discoveryPending = false;
       await saveIntel(email, intel);
       if (account && (account.personalIntelOptIn === true || account.personalIntelAdultConfirmedAt)) {
-        const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
+        const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account;
         await putJson(userKey(email), accountRest);
         account = accountRest;
       }
@@ -1810,13 +1810,13 @@ async function handleIntel(req, res, u) {
     if (req.method === 'GET' && path === '/api/intel') return json(res, 200, intelView(intel, verified, account));
     if (req.method === 'DELETE' && path === '/api/intel') {
       if (account) {
-        const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
+        const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account;
         await putJson(userKey(email), accountRest);
         account = accountRest;
       }
       // Disable AI use before attempting the permanent version purge. If deletion fails,
       // the user sees an error and can retry, but the old profile is not used meanwhile.
-      intel = { ...intel, enabled: false, discoveryPending: false };
+      intel = { ...intel, enabled: false, autoApproveStrong: false, discoveryPending: false };
       intelCache.set(email, { intel, at: Date.now() });
       await saveIntel(email, intel);
       const deletedVersions = await deleteIntelStorageVersions(email);
@@ -1826,7 +1826,17 @@ async function handleIntel(req, res, u) {
     if (req.method !== 'POST' && req.method !== 'PUT' && req.method !== 'DELETE') return json(res, 405, { error: 'Method not allowed.' });
     let body = {};
     if (req.method !== 'DELETE') { try { body = await readBody(req, 20000); } catch { return json(res, 400, { error: 'That request could not be read.' }); } }
-    if (path === '/api/intel/consent') {
+    if (path === '/api/intel/settings' && req.method === 'POST') {
+       if (typeof body.autoApproveStrong !== 'boolean') return json(res, 400, { error: 'autoApproveStrong must be true or false.' });
+       if (body.autoApproveStrong && (!verified || !intel.enabled || account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt || !intel.adultConfirmedAt)) {
+         return json(res, 403, { code: !verified ? 'email_unverified' : 'not_enabled', error: 'Enable verified Personal Intelligence discovery before turning on automatic approval.' });
+       }
+       intel.autoApproveStrong = body.autoApproveStrong;
+       if (intel.autoApproveStrong) intel = autoApproveStrong(intel);
+       await saveIntel(email, intel);
+       return json(res, 200, intelView(intel, verified, account));
+     }
+     if (path === '/api/intel/consent') {
       if (body.enable === true) {
         if (body.acknowledge !== true) return json(res, 400, { error: 'Please confirm you understand what will be searched.' });
         if (body.adultConfirmed !== true) return json(res, 400, { code: 'adult_confirmation_required', error: 'Personal Intelligence discovery is available only to people who confirm they are 18 or older.' });
@@ -1835,7 +1845,7 @@ async function handleIntel(req, res, u) {
         intel = { ...intel, enabled: true, consentAt: now, adultConfirmedAt: now, discoveryPending: true };
         if (account) { account = { ...account, personalIntelOptIn: true, personalIntelAdultConfirmedAt: now }; await putJson(userKey(email), account); }
       } else {
-        intel = { ...intel, enabled: false, discoveryPending: false };
+        intel = { ...intel, enabled: false, autoApproveStrong: false, discoveryPending: false };
         if (account) {
           const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, ...accountRest } = account;
           await putJson(userKey(email), accountRest);
@@ -1855,12 +1865,13 @@ async function handleIntel(req, res, u) {
       const { findings, report } = await discover(email);
       intel = { ...intel, findings: mergeFindings(intel.findings, findings), discoveryPending: false, lastRunAt: new Date().toISOString(), lastRunReport: report };
       intel = cleanIntel(intel);
+      if (intel.autoApproveStrong) intel = autoApproveStrong(intel);
       await saveIntel(email, intel);
       return json(res, 200, intelView(intel, verified, account));
     }
     const m = path.match(/^\/api\/intel\/findings\/([a-f0-9]{16})$/);
     if (m) {
-      if (req.method === 'DELETE') intel.findings = intel.findings.filter(f => f.id !== m[1]);
+      if (req.method === 'DELETE') { if (!removeFinding(intel, m[1])) return json(res, 404, { error: 'Finding not found.' }); }
       else {
         if (!['approved', 'rejected', 'pending'].includes(body.status)) return json(res, 400, { error: 'Status must be approved, rejected or pending.' });
         if (!applyApproval(intel, m[1], body.status)) return json(res, 404, { error: 'Finding not found.' });
@@ -1945,8 +1956,9 @@ http.createServer(async (req, res) => {
       if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { res.writeHead(400); return res.end('Enter a valid email address.'); }
       const personalIntelOptIn = site && mode === 'signup' && u.searchParams.get('intel') === '1';
       const personalIntelAdultConfirmed = site && mode === 'signup' && u.searchParams.get('intel_adult') === '1';
+      const personalIntelAutoApproveStrong = site && mode === 'signup' && personalIntelOptIn && personalIntelAdultConfirmed && u.searchParams.get('intel_auto') === '1';
       if (personalIntelOptIn && !personalIntelAdultConfirmed) { res.writeHead(400); return res.end('Personal Intelligence requires a separate confirmation that you are 18 or older.'); }
-      const state = sign({ ext, site, mode, email, termsAccepted, personalIntelOptIn, personalIntelAdultConfirmed, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
+      const state = sign({ ext, site, mode, email, termsAccepted, personalIntelOptIn, personalIntelAdultConfirmed, personalIntelAutoApproveStrong, n: crypto.randomUUID(), exp: Date.now() + 10 * 60e3 });
       const params = new URLSearchParams({
         client_id: GOOGLE_CLIENT_ID, redirect_uri: REDIRECT, response_type: 'code',
         scope: 'openid email profile', state, prompt: 'select_account'
@@ -1977,7 +1989,7 @@ http.createServer(async (req, res) => {
       })).json();
       if (!info.email || !info.email_verified) return back(res, st, { error: 'unverified_email' });
       const user = { email: info.email, name: info.name || '', picture: info.picture || '' };
-      const account = await recordSignIn(user, st.mode, { requireSignupConsent: !!st.site, termsAccepted: !!st.termsAccepted, personalIntelOptIn: st.personalIntelOptIn === true, personalIntelAdultConfirmed: st.personalIntelAdultConfirmed === true });
+      const account = await recordSignIn(user, st.mode, { requireSignupConsent: !!st.site, termsAccepted: !!st.termsAccepted, personalIntelOptIn: st.personalIntelOptIn === true, personalIntelAdultConfirmed: st.personalIntelAdultConfirmed === true, personalIntelAutoApproveStrong: st.personalIntelAutoApproveStrong === true });
       if (account?.authError) return back(res, account.authError === 'account_not_found' ? { ...st, email: normEmail(user.email) } : st, { error: account.authError });
       if (account?.status === 'suspended') return back(res, st, { error: 'account_suspended' });
       return back(res, st, { token: sign({ ...user, accountId: account.accountId, exp: Date.now() + 30 * 864e5 }), ...user });
