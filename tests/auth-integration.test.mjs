@@ -151,6 +151,8 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(intelState.emailVerified, false);
   assert.equal(intelState.signupOptInPending, true, 'the unverified account can see and cancel its saved signup opt-in');
   assert.equal(intelState.enabled, false, 'unverified email/password accounts cannot start discovery');
+  response = await fetch(`${base}/api/intel/settings`, { method: 'POST', headers: { Authorization: 'Bearer ' + passwordSession.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ autoApproveStrong: true }) });
+  assert.equal(response.status, 403, 'unverified email cannot enable automatic approval');
   response = await fetch(`${base}/api/intel/discover`, { method: 'POST', headers: { Authorization: 'Bearer ' + passwordSession.token, 'Content-Type': 'application/json' }, body: '{}' });
   assert.equal(response.status, 403, 'discovery rejects unverified email/password sessions');
   response = await callback(await start('signin', 'pending.email@example.com'), 'intel-password-google-code');
