@@ -24,6 +24,25 @@ Backblaze B2 (S3-compatible API, no extra packages):
 
 Without these the site still signs people in, but nothing is saved and the sign-up questions are skipped.
 
+
+### Admin Backblaze storage management
+
+The protected admin API exposes bucket metadata, paginated object inventory, and version-aware deletion previews. The dashboard uses the existing private bucket and never receives B2 credentials. The storage inventory recognizes these Viora namespaces:
+
+- `planner/`: per-account Planner state.
+- `planner-files/`: Planner task attachments.
+- `intel/`: opt-in Personal Intelligence data.
+- `labs/`: Labs CMS tool/article JSON and uploaded media.
+- `users/`: account identity, profile, plan, and credit records (**protected**).
+- `deleted/`: account-deletion tombstones (**protected**).
+- `admin/audit/`: administrator audit events (**protected**).
+
+Unknown bucket objects are visible as unclassified/read-only and are never eligible for deletion. “Delete All Info from Blackblaze” is intentionally scoped to the four deletable application-data namespaces above; it preserves account/authentication records, tombstones, audit history, and unrelated objects. Selected-object and bulk deletion first create an exact version manifest, then require the exact typed phrase and a separate second confirmation. All object versions and delete markers are removed and the remaining versions are checked before a successful result is returned.
+
+The B2 application key needs permission to list files and object versions, read object metadata, and permanently delete specific versions. In Backblaze B2, configure a bucket-restricted key with the relevant `listFiles`, `readFiles`, `writeFiles`, and `deleteFiles` capabilities. The dashboard reports bucket reachability and endpoint metadata; bucket privacy itself must still be verified in the Backblaze console.
+
+The destructive-operation preview is held in server memory for five minutes and expires on a server restart. Large deletion manifests are capped for safety; oversized operations must be divided into smaller category or selected-object batches. No bulk deletion is run by tests or deployment.
+
 ## What is stored
 One JSON object per account at `users/<sha256 of email>.json`: name, email, picture, first and latest sign-in, sign-in count,
 and the answers to the 5 sign-up questions (`profile.js`). Only the fixed option ids are accepted.
