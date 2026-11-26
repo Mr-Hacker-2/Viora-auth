@@ -106,7 +106,31 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer ' + freshToken } });
   assert.equal(response.status, 200, 'the fresh account has its own valid session');
 
+  const otherEmail = 'other.user@example.com';
+  response = await callback(await start('signup', otherEmail, true), 'other-user-code');
+  destination = new URL(response.headers.get('location'));
+  const otherToken = new URLSearchParams(destination.hash.slice(1)).get('token');
+  assert.ok(otherToken, 'a second account can be created for admin-management integration tests');
+
   const adminHeaders = { Authorization: 'Bearer ' + freshToken, 'Content-Type': 'application/json' };
+  response = await fetch(`${base}/api/admin/users/premium`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ email: otherEmail, premium: true, days: 30 }) });
+  assert.equal(response.status, 200, 'administrator can grant a time-limited premium plan');
+  assert.equal((await response.json()).premium, true);
+  response = await fetch(`${base}/api/admin/users/credits`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ email: otherEmail, set: 125 }) });
+  assert.equal(response.status, 200, 'administrator can set a user's credit balance');
+  assert.equal((await response.json()).credits, 125);
+  response = await fetch(`${base}/api/admin/users/role`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ email: otherEmail, role: 'admin' }) });
+  assert.equal(response.status, 200, 'administrator can grant a stored admin role');
+  response = await fetch(`${base}/api/admin/users/role`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ email: otherEmail, role: 'user' }) });
+  assert.equal(response.status, 200, 'administrator can revoke a stored admin role when another admin remains');
+  response = await fetch(`${base}/api/admin/users/status`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ email: otherEmail, status: 'suspended' }) });
+  assert.equal(response.status, 200, 'administrator can suspend a regular account');
+  response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer ' + otherToken } });
+  assert.equal(response.status, 401, 'suspended accounts are denied by authenticated routes');
+  response = await fetch(`${base}/api/admin/users/status`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ email: otherEmail, status: 'active' }) });
+  assert.equal(response.status, 200, 'administrator can reactivate a suspended account');
+
+
   response = await fetch(`${base}/api/admin/storage/summary`, { headers: adminHeaders });
   assert.equal(response.status, 200, 'storage summary is protected but available to a server-authorized admin');
   const storageSummary = await response.json();
