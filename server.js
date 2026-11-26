@@ -1856,7 +1856,7 @@ async function handleIntel(req, res, u) {
       intel = { ...intel, findings: mergeFindings(intel.findings, findings), discoveryPending: false, lastRunAt: new Date().toISOString(), lastRunReport: report };
       intel = cleanIntel(intel);
       await saveIntel(email, intel);
-      return json(res, 200, intelView(intel, verified));
+      return json(res, 200, intelView(intel, verified, account));
     }
     const m = path.match(/^\/api\/intel\/findings\/([a-f0-9]{16})$/);
     if (m) {
@@ -1866,12 +1866,12 @@ async function handleIntel(req, res, u) {
         if (!applyApproval(intel, m[1], body.status)) return json(res, 404, { error: 'Finding not found.' });
       }
       await saveIntel(email, intel);
-      return json(res, 200, intelView(intel, verified));
+      return json(res, 200, intelView(intel, verified, account));
     }
     if (path === '/api/intel/profile' && (req.method === 'PUT' || req.method === 'POST')) {
       intel.profile = cleanProfile(body.profile);
       await saveIntel(email, intel);
-      return json(res, 200, intelView(intel, verified));
+      return json(res, 200, intelView(intel, verified, account));
     }
     return json(res, 404, { error: 'Not found.' });
   } catch (e) {
