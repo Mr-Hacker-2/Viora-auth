@@ -95,11 +95,13 @@ Audio is handled in memory for one request: it is never written to disk, never l
 
 ## Personal Intelligence (opt-in public footprint discovery)
 
-Routes (all require the signed-in session; every route only reads or writes the caller's own data, stored privately at `intel/<sha256(email)>.json` in B2):
-`GET /api/intel`, `POST /api/intel/consent` `{enable, acknowledge}`, `POST /api/intel/discover`, `POST|DELETE /api/intel/findings/:id`, `PUT /api/intel/profile`, `DELETE /api/intel`.
+Routes (all require the signed-in session; every route reads or writes only the caller's own profile, stored privately at `intel/<sha256(email)>.json` in B2):
+`GET /api/intel`, `POST /api/intel/consent` `{enable, acknowledge, adultConfirmed}`, `POST /api/intel/discover`, `POST|DELETE /api/intel/findings/:id`, `PUT /api/intel/profile`, `DELETE /api/intel`.
 
-- Discovery requires `emailVerified: true` on the account (Google sign-in), so nobody can register another person's address and look them up. Password-only accounts are refused until a verification flow exists.
-- Sources: GitHub REST user search (`in:email`, only matches emails users made public), Gravatar REST v3 profile for the email hash, Brave Search API exact-email search. No scraping, no logins.
-- Env vars: `BRAVE_SEARCH_API_KEY` (required for web results; without it that source reports "not configured"), `GITHUB_TOKEN` and `GRAVATAR_API_KEY` (optional, higher rate limits).
-- One discovery run per account every 10 minutes (in-memory). Findings stay `pending` until the user approves; only approved, request-relevant profile items (max 8) are added to the chat system prompt for Flash, Pro Search and Math & Code. The Humanizer gets none, so rewrites never gain facts.
-- Account deletion also deletes the Personal Intelligence object.
+- Discovery is optional, off by default, and restricted to people who explicitly confirm they are 18 or older. A verified email is also required before any search runs.
+- Website sign-up offers a separate opt-in. Google sign-up can queue the first run immediately after verified account creation. Email/password sign-up can save the opt-in, but discovery remains disabled until the same email is later verified with Google.
+- Sources: GitHub REST user search (`in:email`, limited to emails users made public), Gravatar REST v3 profile for the email hash, and Brave Search API exact-email search. These are the only enabled integrations; no private-account access, login walls, scraping, or leaked data.
+- Env vars: `BRAVE_SEARCH_API_KEY` (required for public web results; without it that source reports "not configured"), `GITHUB_TOKEN` and `GRAVATAR_API_KEY` (optional, higher rate limits). Credentials stay on the server.
+- One discovery run per account every 10 minutes (in-memory). Findings remain pending until the user approves them. Approval adds editable profile facts. Only approved, request-relevant profile items (max 8) are added to the chat system prompt; Humanizer receives none.
+- The About you & Memory dialog shows the approved profile summary. The full dashboard lets users review, reject, correct, disable, or delete discoveries. Disabling removes AI access and stops future discovery.
+- Profile deletion permanently removes all B2 versions and delete markers for that account's Personal Intelligence object and clears the account's saved opt-in. Account deletion also removes the Personal Intelligence object.

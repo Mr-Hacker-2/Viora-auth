@@ -41,9 +41,10 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   const badEmail = await fetch(`${base}/auth/google?site=1&email=not-an-email`, { redirect: 'manual' });
   assert.equal(badEmail.status, 400);
 
-  async function start(mode, email, terms = false) {
+  async function start(mode, email, terms = false, personalIntelOptIn = false) {
     const query = new URLSearchParams({ site: '1', mode, email });
     if (terms) query.set('terms', '1');
+    if (personalIntelOptIn) { query.set('intel', '1'); query.set('intel_adult', '1'); }
     const response = await fetch(`${base}/auth/google?${query}`, { redirect: 'manual' });
     assert.equal(response.status, 302);
     const provider = new URL(response.headers.get('location'));
@@ -64,9 +65,11 @@ test('website OAuth requires explicit sign-up and verifies account state after G
 
   const noConsent = await fetch(`${base}/auth/google?site=1&mode=signup&email=${encodeURIComponent(newEmail)}`, { redirect: 'manual' });
   assert.equal(noConsent.status, 400, 'server requires explicit terms acceptance');
+  const noAdultIntel = await fetch(`${base}/auth/google?site=1&mode=signup&terms=1&intel=1&email=${encodeURIComponent(newEmail)}`, { redirect: 'manual' });
+  assert.equal(noAdultIntel.status, 400, 'server rejects discovery opt-in without the separate adult confirmation');
   response = await callback(await start('signup', newEmail, true), 'unverified');
   assert.equal(new URLSearchParams(new URL(response.headers.get('location')).hash.slice(1)).get('error'), 'unverified_email');
-  response = await callback(await start('signup', newEmail, true));
+  response = await callback(await start('signup', newEmail, true, true));
   destination = new URL(response.headers.get('location'));
   assert.equal(destination.pathname, '/signup.html');
   const createdToken = new URLSearchParams(destination.hash.slice(1)).get('token');
@@ -77,6 +80,68 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer ' + createdToken } });
   assert.equal(response.status, 200, 'the website verifies with the Authorization header');
   assert.equal((await response.json()).email, newEmail);
+
+  const intelHeaders = { Authorization: 'Bearer ' + createdToken, 'Content-Type': 'application/json' };
+  response = await fetch(`${base}/api/intel`, { headers: intelHeaders });
+  assert.equal(response.status, 200);
+  let intelState = await response.json();
+  assert.equal(intelState.enabled, true, 'Google sign-up stores the explicit discovery opt-in');
+  assert.equal(intelState.discoveryPending, true, 'first discovery is queued until the signed-in app opens');
+  assert.equal(intelState.emailVerified, true);
+  response = await fetch(`${base}/api/intel/consent`, { method: 'POST', headers: intelHeaders, body: JSON.stringify({ enable: true, acknowledge: true }) });
+  assert.equal(response.status, 400, 'server requires adult confirmation even when the user has an existing opt-in');
+  response = await fetch(`${base}/api/intel/profile`, { method: 'PUT', headers: intelHeaders, body: JSON.stringify({ profile: { skills: ['Rust'] } }) });
+  assert.equal(response.status, 200);
+  response = await fetch(`${base}/api/intel/profile`, { method: 'PUT', headers: intelHeaders, body: JSON.stringify({ profile: { skills: ['Rust', 'Python'] } }) });
+  assert.equal(response.status, 200, 'profile edits are saved as separate object versions');
+
+  const otherEmail = 'other.user@example.com';
+  response = await callback(await start('signup', otherEmail, true), 'other-user-code');
+  let destinationOther = new URL(response.headers.get('location'));
+  const otherToken = new URLSearchParams(destinationOther.hash.slice(1)).get('token');
+  assert.ok(otherToken);
+  response = await fetch(`${base}/api/intel`, { headers: { Authorization: 'Bearer ' + otherToken } });
+  const otherIntel = await response.json();
+  assert.equal(otherIntel.enabled, false);
+  assert.deepEqual(otherIntel.profile.skills, [], 'a second account cannot read the first account\'s profile');
+  response = await fetch(`${base}/api/intel?email=${encodeURIComponent(otherEmail)}`, { headers: intelHeaders });
+  intelState = await response.json();
+  assert.deepEqual(intelState.profile.skills, ['Rust', 'Python'], 'a caller cannot switch the account selected by an email query');
+
+  response = await fetch(`${base}/api/intel`, { method: 'DELETE', headers: intelHeaders });
+  assert.equal(response.status, 200, 'profile deletion succeeds');
+  const deletion = await response.json();
+  assert.equal(deletion.deleted, true);
+  assert.equal(deletion.deletedVersions, 4, 'all previous B2 versions, including the disabled state, are permanently removed');
+  response = await fetch(`${base}/api/intel`, { headers: intelHeaders });
+  intelState = await response.json();
+  assert.equal(intelState.enabled, false);
+  assert.deepEqual(intelState.profile.skills, [], 'deleted profile does not reappear from an older object version');
+
+  const passwordSignup = await fetch(`${base}/api/auth/signup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'pending.email@example.com', password: 'ValidPassword123!', terms: true, personalIntelOptIn: true, personalIntelAdultConfirmed: true }) });
+  assert.equal(passwordSignup.status, 200, 'email/password signup can save an explicit discovery opt-in while unverified');
+  const passwordSession = await passwordSignup.json();
+  response = await fetch(`${base}/api/intel`, { headers: { Authorization: 'Bearer ' + passwordSession.token } });
+  intelState = await response.json();
+  assert.equal(intelState.emailVerified, false);
+  assert.equal(intelState.signupOptInPending, true, 'the unverified account can see and cancel its saved signup opt-in');
+  assert.equal(intelState.enabled, false, 'unverified email/password accounts cannot start discovery');
+  response = await fetch(`${base}/api/intel/discover`, { method: 'POST', headers: { Authorization: 'Bearer ' + passwordSession.token, 'Content-Type': 'application/json' }, body: '{}' });
+  assert.equal(response.status, 403, 'discovery rejects unverified email/password sessions');
+  response = await callback(await start('signin', 'pending.email@example.com'), 'intel-password-google-code');
+  const passwordGoogleToken = new URLSearchParams(new URL(response.headers.get('location')).hash.slice(1)).get('token');
+  assert.ok(passwordGoogleToken);
+  response = await fetch(`${base}/api/intel`, { headers: { Authorization: 'Bearer ' + passwordGoogleToken } });
+  intelState = await response.json();
+  assert.equal(intelState.enabled, true, 'the saved opt-in activates after Google verifies the same email');
+  assert.equal(intelState.discoveryPending, true);
+  response = await fetch(`${base}/api/intel/consent`, { method: 'POST', headers: { Authorization: 'Bearer ' + passwordGoogleToken, 'Content-Type': 'application/json' }, body: JSON.stringify({ enable: false }) });
+  assert.equal(response.status, 200, 'a verified user can disable discovery');
+  response = await fetch(`${base}/api/intel`, { headers: { Authorization: 'Bearer ' + passwordGoogleToken } });
+  intelState = await response.json();
+  assert.equal(intelState.enabled, false);
+  assert.equal(intelState.signupOptInPending, false);
+
   response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer invalid' } });
   assert.equal(response.status, 401, 'an invalid header token is rejected');
   response = await fetch(`${base}/api/verify?token=invalid`);
@@ -106,10 +171,6 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/verify`, { headers: { Authorization: 'Bearer ' + freshToken } });
   assert.equal(response.status, 200, 'the fresh account has its own valid session');
 
-  const otherEmail = 'other.user@example.com';
-  response = await callback(await start('signup', otherEmail, true), 'other-user-code');
-  destination = new URL(response.headers.get('location'));
-  const otherToken = new URLSearchParams(destination.hash.slice(1)).get('token');
   assert.ok(otherToken, 'a second account can be created for admin-management integration tests');
 
   const adminHeaders = { Authorization: 'Bearer ' + freshToken, 'Content-Type': 'application/json' };
@@ -134,9 +195,9 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/admin/overview`, { headers: adminHeaders });
   assert.equal(response.status, 200, 'overview returns verified account aggregates');
   const overview = await response.json();
-  assert.equal(overview.users.total, 2);
+  assert.equal(overview.users.total, 3);
   assert.equal(overview.users.premium, 1);
-  assert.equal(overview.users.free, 1);
+  assert.equal(overview.users.free, 2);
   assert.equal(overview.credits.remainingBalance, 125);
   assert.equal(overview.credits.usageTracked, false, 'credit consumption is not fabricated when it is not persisted');
 
@@ -149,7 +210,7 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   response = await fetch(`${base}/api/admin/storage/preview`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ scope: 'all' }) });
   assert.equal(response.status, 200, 'admin can generate a non-destructive bulk deletion preview');
   const storagePreview = await response.json();
-  assert.equal(storagePreview.objectCount, 0, 'the test account record is protected from bulk deletion');
+  assert.equal(storagePreview.objectCount, 1, 'only the explicitly deletable pending Personal Intelligence object is in scope; user account records remain protected');
   response = await fetch(`${base}/api/admin/storage/delete`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ planId: storagePreview.planId, confirmation: 'DELETE ALL VIORA STORAGE', secondConfirm: false }) });
   assert.equal(response.status, 400, 'storage deletion requires both confirmations');
   response = await fetch(`${base}/api/admin/storage/summary`);
