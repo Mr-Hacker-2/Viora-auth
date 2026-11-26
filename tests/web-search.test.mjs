@@ -148,3 +148,46 @@ test('quick search refines once when the first query returns no relevant results
   assert.equal(result.queries.length, 2);
   assert.equal(result.sources.length, 1);
 });
+
+
+test('Brave LLM Context supplies extracted page evidence and source metadata when configured', async () => {
+  const previousKey = process.env.BRAVE_SEARCH_API_KEY;
+  process.env.BRAVE_SEARCH_API_KEY = 'test-brave-key';
+  const requested = [];
+  const fetchImpl = async rawUrl => {
+    const url = new URL(String(rawUrl));
+    requested.push({ url, headers: arguments });
+    if (url.hostname === 'api.search.brave.com') {
+      assert.equal(url.pathname, '/res/v1/llm/context');
+      assert.equal(url.searchParams.get('safesearch'), 'strict');
+      assert.equal(url.searchParams.get('context_threshold_mode'), 'balanced');
+      return new Response(JSON.stringify({
+        grounding: { generic: [{
+          url: 'https://www.raspberrypi.com/documentation/computers/raspberry-pi.html',
+          title: 'Raspberry Pi computer documentation',
+          snippets: ['Raspberry Pi 5 technical specifications and hardware documentation.']
+        }] },
+        sources: {
+          'https://www.raspberrypi.com/documentation/computers/raspberry-pi.html': {
+            title: 'Raspberry Pi computer documentation',
+            hostname: 'raspberrypi.com',
+            age: ['November 25, 2026', '2026-11-25', '1 day ago', '2026-11-25T12:00:00Z']
+          }
+        }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.hostname === 'www.bing.com') return response(rss([]));
+    throw new Error('Unexpected search provider: ' + url.hostname);
+  };
+  try {
+    const result = await searchWeb('Raspberry Pi 5 hardware specifications', 'quick', null, fetchImpl);
+    assert.equal(result.status.outcome, 'sources_retrieved');
+    assert.ok(result.sources.some(source => source.url.includes('raspberrypi.com/documentation')));
+    const braveAttempt = result.attempts.find(attempt => attempt.provider === 'Brave LLM Context');
+    assert.equal(braveAttempt?.succeeded, true);
+    assert.equal(new URL(requested[0].url).searchParams.get('maximum_number_of_tokens'), '8192');
+  } finally {
+    if (previousKey === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
+    else process.env.BRAVE_SEARCH_API_KEY = previousKey;
+  }
+});
