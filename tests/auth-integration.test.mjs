@@ -209,6 +209,15 @@ test('website OAuth requires explicit sign-up and verifies account state after G
   assert.equal(response.status, 200, 'administrator can reactivate a suspended account');
 
 
+  response = await fetch(`${base}/api/admin/users?plan=premium&status=active&role=user`, { headers: adminHeaders });
+  assert.equal(response.status, 200, 'administrator can filter account records by plan, status, and role');
+  const filteredUsers = await response.json();
+  assert.equal(filteredUsers.users.length, 1);
+  assert.equal(filteredUsers.users[0].email, otherEmail);
+  response = await fetch(`${base}/api/admin/users?provider=password`, { headers: adminHeaders });
+  assert.equal(response.status, 200, 'administrator can filter by sign-up method');
+  assert.ok((await response.json()).users.every(user => user.provider === 'password'));
+
   response = await fetch(`${base}/api/admin/overview`, { headers: adminHeaders });
   assert.equal(response.status, 200, 'overview returns verified account aggregates');
   const overview = await response.json();
