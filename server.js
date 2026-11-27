@@ -861,8 +861,18 @@ async function handleAdmin(req, res, u) {
         lastIp: String(row.lastIp || '').slice(0, 45), lastSeenAt: row.lastSeenAt || null,
         ips: Array.isArray(row.ips) ? row.ips.slice(0, 10).map(e => ({ ip: String((e && e.ip) || '').slice(0, 45), firstAt: (e && e.firstAt) || null, lastAt: (e && e.lastAt) || null })) : [],
         location: adminLocation(row)
-      })).filter(row => !query || (row.email + ' ' + row.name).toLowerCase().includes(query))
-        .sort((a, b) => String(b.lastLoginAt || '').localeCompare(String(a.lastLoginAt || '')));
+      })).filter(row => {
+        if (query && !(row.email + ' ' + row.name).toLowerCase().includes(query)) return false;
+        const status = u.searchParams.get('status') || 'all';
+        const plan = u.searchParams.get('plan') || 'all';
+        const role = u.searchParams.get('role') || 'all';
+        const provider = u.searchParams.get('provider') || 'all';
+        if (['active', 'suspended'].includes(status) && row.status !== status) return false;
+        if (['premium', 'free'].includes(plan) && row.premium !== (plan === 'premium')) return false;
+        if (['admin', 'user'].includes(role) && row.role !== role) return false;
+        if (['google', 'password'].includes(provider) && row.provider !== provider) return false;
+        return true;
+      }).sort((a, b) => String(b.lastLoginAt || '').localeCompare(String(a.lastLoginAt || '')));
       const start = (page - 1) * perPage;
       await writeAdminAudit(actor, 'admin_viewed_user_ips_and_locations', 'users', 'success', { page, perPage, searched: !!query });
       return json(res, 200, { users: sorted.slice(start, start + perPage), total: truncated ? null : sorted.length, page, perPage, truncated });
