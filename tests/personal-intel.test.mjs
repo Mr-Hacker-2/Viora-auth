@@ -116,3 +116,68 @@ test('manual undo clears autoApproved and removes its tracked facts', () => {
   const next = autoApproveStrong(intel); applyApproval(next, next.findings[0].id, 'pending');
   assert.equal(next.findings[0].autoApproved, false); assert.deepEqual(next.profile.skills, []);
 });
+
+import { readFile } from 'node:fs/promises';
+import { canonicalUrl, editFindingFacts, reviewFindings } from '../personal-intel.js';
+
+test('duplicate findings: tracking links, www and trailing slashes collapse to one page; facts merge without repeats', () => {
+  assert.equal(canonicalUrl('https://www.GitHub.com/ada/?utm_source=x#top'), canonicalUrl('https://github.com/ada'));
+  const out = reviewFindings([
+    { source: 'GitHub', url: 'https://github.com/ada', confidence: 'strong', matchBasis: 'public email', facts: [{ category: 'skills', text: 'Rust' }] },
+    { source: 'Gravatar', url: 'https://www.github.com/ada/', confidence: 'possible', matchBasis: 'linked', facts: [{ category: 'skills', text: 'rust' }, { category: 'interests', text: 'Chess' }] },
+    { source: 'Web', url: 'https://example.org/page', confidence: 'uncertain', facts: [] }
+  ]);
+  assert.equal(out.length, 2);
+  const gh = out.find(f => f.url.includes('github'));
+  assert.equal(gh.confidence, 'strong');
+  assert.deepEqual(gh.sources.sort(), ['GitHub', 'Gravatar']);
+  assert.equal(gh.facts.length, 2);
+  assert.match(gh.matchBasis, /also reported by Gravatar/);
+});
+
+test('corroboration never turns a weak match into proof: uncertain can become possible, never strong', () => {
+  const [f] = reviewFindings([
+    { source: 'Web', url: 'https://example.org/p', confidence: 'uncertain' },
+    { source: 'Other', url: 'https://example.org/p/', confidence: 'uncertain' }
+  ]);
+  assert.equal(f.confidence, 'possible');
+  const [g] = reviewFindings([{ source: 'A', url: 'https://x.example/u', confidence: 'possible' }, { source: 'B', url: 'https://x.example/u', confidence: 'possible' }]);
+  assert.equal(g.confidence, 'possible');
+});
+
+test('re-discovery keeps the existing id, decision and user edits, flags only truly new pages, and never auto-approves uncertain ones', () => {
+  const first = mergeFindings([], [{ source: 'GitHub', url: 'https://github.com/ada', confidence: 'strong', facts: [{ category: 'skills', text: 'Rust' }] }]);
+  const id = first[0].id;
+  assert.equal(first[0].isNew, true);
+  let intel = { ...emptyIntel(), enabled: true, findings: first };
+  applyApproval(intel, id, 'approved');
+  editFindingFacts(intel, id, [{ category: 'skills', text: 'Rust (systems)' }]);
+  assert.deepEqual(intel.profile.skills, ['Rust (systems)'], 'editing an approved finding swaps its profile entry');
+  const again = mergeFindings(intel.findings, [
+    { source: 'GitHub', url: 'https://www.github.com/ada/', confidence: 'strong', facts: [{ category: 'skills', text: 'Go' }] },
+    { source: 'Web', url: 'https://blog.example/ada', confidence: 'uncertain', facts: [{ category: 'skills', text: 'Haskell' }] }
+  ]);
+  assert.equal(again.length, 2);
+  const kept = again.find(f => f.id === id);
+  assert.equal(kept.status, 'approved'); assert.equal(kept.isNew, false);
+  assert.deepEqual(kept.facts, [{ category: 'skills', text: 'Rust (systems)' }], 'user edits survive a new run');
+  const fresh = again.find(f => f.id !== id);
+  assert.equal(fresh.isNew, true);
+  const next = autoApproveStrong({ ...intel, findings: again });
+  assert.equal(next.findings.find(f => f.id !== id).status, 'pending', 'uncertain findings are never added to the profile automatically');
+  assert.equal(next.profile.skills.includes('Haskell'), false);
+});
+
+test('a failed or partial run cannot corrupt existing profile data: only commit-time merges touch it, and they keep prior items', () => {
+  const intel = { ...emptyIntel(), enabled: true, profile: { ...emptyIntel().profile, skills: ['Typed by the user'] } };
+  const merged = mergeFindings(intel.findings, []);
+  assert.deepEqual(merged, []);
+  assert.deepEqual(intel.profile.skills, ['Typed by the user']);
+});
+
+test('no cooldown wording or in-memory run tracking remains in the server', async () => {
+  for (const file of ['../server.js', '../intel-jobs.js', '../personal-intel.js']) {
+    const src = await readFile(new URL(file, import.meta.url), 'utf8');
+    assert.doesNotMatch(src, /ran recently|another search in about|retryAfterSeconds|intelRuns|intelInFlight/);
+  }
+});

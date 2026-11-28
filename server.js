@@ -16,7 +16,8 @@ import { clientIp, seenUpdate, cleanLocation, locationPrompt, adminLocation, NO_
 import { PASSWORD_MAX, checkPassword, hashPassword, verifyPassword, DUMMY_HASH } from './password.js';
 import { handleLabsAdmin, handleLabsPublic } from './labs-cms.js';
 import { createStorageAdmin } from './admin-storage.js';
-import { CATEGORIES, CATEGORY_LABELS, SOURCES as INTEL_SOURCES, applyApproval, autoApproveStrong, cleanIntel, cleanProfile, discover, emptyIntel, intelKey, mergeFindings, relevantContext, removeFinding } from './personal-intel.js';
+import { CATEGORIES, CATEGORY_LABELS, SOURCES as INTEL_SOURCES, applyApproval, autoApproveStrong, cleanIntel, cleanProfile, editFindingFacts, emptyIntel, intelKey, mergeFindings, relevantContext, removeFinding } from './personal-intel.js';
+import { createIntelQueue, jobsKey } from './intel-jobs.js';
 
 const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_SECRET } = process.env;
 const BASE = process.env.BASE_URL || 'https://viora-auth.onrender.com';
@@ -217,6 +218,7 @@ async function deleteAccountStorageVersions(email, digest) {
     { prefix: userKey(email), exact: true },
     { prefix: plannerKey(email), exact: true },
     { prefix: intelKey(email), exact: true },
+    { prefix: jobsKey(email), exact: true },
     { prefix: `planner-files/${digest}/`, exact: false },
     ...auditKeys.map(key => ({ prefix: key, exact: true }))
   ];
@@ -1077,6 +1079,8 @@ async function recordSignIn(user, mode, { requireSignupConsent = false, termsAcc
           await putJson(intelKey(user.email), { ...priorIntel, enabled: true, autoApproveStrong: old?.personalIntelAutoApproveStrong === true || personalIntelAutoApproveStrong === true, consentAt: priorIntel.consentAt || now, adultConfirmedAt: priorIntel.adultConfirmedAt || rec.personalIntelAdultConfirmedAt || now, discoveryPending: true });
           intelCache.delete(normEmail(user.email));
         }
+        // Verified account + explicit opt-in: queue the first discovery on the server now. The browser never has to open anything.
+        await ensureFirstDiscovery(normEmail(user.email), cleanIntel(await getJson(intelKey(user.email))));
       } catch (error) {
         // The optional feature must never prevent a verified account from signing in.
         console.warn('Personal Intelligence opt-in queued but profile storage is temporarily unavailable:', error?.message || error);
@@ -1733,10 +1737,20 @@ async function chat(req, res, user) {
   }
 }
 
-/* ================= Personal Intelligence (opt-in, per-account, stored privately in B2) ================= */
+/* ================= Personal Intelligence (opt-in, per-account, stored privately in B2) =================
+   Discovery runs as persistent server-side jobs (intel-jobs.js): the browser only asks for a run and watches progress.
+   All writes to an account's profile document go through withIntelLock, and the background worker saves through the same lock. */
 const intelCache = new Map();
-const intelRuns = new Map(); // email -> last successful discovery time (one run per 10 minutes per account)
-const intelInFlight = new Set(); // prevent overlapping searches for the same account
+const intelLocks = new Map();
+const withIntelLock = (email, fn) => {
+  const prev = intelLocks.get(email) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  const tail = next.catch(() => {});
+  intelLocks.set(email, tail);
+  tail.then(() => { if (intelLocks.get(email) === tail) intelLocks.delete(email); });
+  return next;
+};
+const envNumber = (name, fallback) => { const n = Number(process.env[name]); return Number.isFinite(n) && n > 0 ? n : fallback; };
 async function cachedIntel(email) {
   if (!b2Ready()) return null;
   // Check the account's explicit opt-in on every AI request. This makes opt-out effective
@@ -1755,42 +1769,113 @@ async function cachedIntel(email) {
 }
 const saveIntel = async (email, intel) => { await putJson(intelKey(email), intel); intelCache.set(email, { intel, at: Date.now() }); };
 const intelView = (intel, verified, account = null) => ({ ...intel, autoApproveStrong: intel.autoApproveStrong === true, emailVerified: verified, signupOptInPending: !verified && account?.personalIntelOptIn === true && typeof account.personalIntelAdultConfirmedAt === 'string', categories: CATEGORIES.map(id => ({ id, label: CATEGORY_LABELS[id] })), sources: INTEL_SOURCES.map(s => ({ id: s.id, label: s.label, configured: s.configured(), note: s.note() })) });
-async function deleteIntelStorageVersions(email) {
-  const key = intelKey(email), versions = [];
-  let keyMarker = '', versionIdMarker = '';
-  do {
-    const page = await listObjectVersions(key, keyMarker, versionIdMarker, 1000);
-    versions.push(...page.versions.filter(item => item.key === key));
-    if (versions.length > 10000) throw new Error('personal_intel_version_limit_exceeded');
-    if (!page.truncated) break;
-    if (!page.nextKeyMarker || !page.nextVersionIdMarker) throw new Error('personal_intel_pagination_failed');
-    keyMarker = page.nextKeyMarker; versionIdMarker = page.nextVersionIdMarker;
-  } while (true);
-  for (let i = 0; i < versions.length; i += 50) {
-    const results = await Promise.allSettled(versions.slice(i, i + 50).map(item => deleteObjectVersion(item.key, item.versionId)));
-    if (results.some(result => result.status === 'rejected')) throw new Error('personal_intel_version_delete_failed');
-  }
-  let verifyKey = '', verifyVersion = '';
-  do {
-    const page = await listObjectVersions(key, verifyKey, verifyVersion, 1000);
-    if (page.versions.some(item => item.key === key)) throw new Error('personal_intel_delete_verification_failed');
-    if (!page.truncated) break;
-    if (!page.nextKeyMarker || !page.nextVersionIdMarker) throw new Error('personal_intel_verification_pagination_failed');
-    verifyKey = page.nextKeyMarker; verifyVersion = page.nextVersionIdMarker;
-  } while (true);
-  return versions.length;
+
+/** Every condition discovery needs, read fresh from storage. Checked before a job starts, between steps, and again inside the final save. */
+async function intelEligibility(email) {
+  if (!b2Ready()) return { ok: false, reason: 'storage_unavailable' };
+  const digest = crypto.createHash('sha256').update(normEmail(email)).digest('hex');
+  if (await getJson(`deleted/${digest}.json`)) return { ok: false, reason: 'account_deleted' };
+  const account = await getJson(userKey(email));
+  if (!account || account.status === 'suspended') return { ok: false, reason: 'no_account' };
+  if (account.emailVerified !== true) return { ok: false, reason: 'email_unverified' };
+  if (account.personalIntelOptIn !== true || typeof account.personalIntelAdultConfirmedAt !== 'string') return { ok: false, reason: 'not_enabled' };
+  const intel = cleanIntel(await getJson(intelKey(email)));
+  if (!intel.enabled || !intel.adultConfirmedAt) return { ok: false, reason: 'not_enabled' };
+  if (intel.paused) return { ok: false, reason: 'paused' };
+  return { ok: true, intel, account };
 }
+
+/** The single place a finished job touches the profile. Re-checks consent, merges into the CURRENT document, writes once. */
+async function commitDiscovery(email, { findings, report, jobId, finishedAt }) {
+  return withIntelLock(email, async () => {
+    const eligible = await intelEligibility(email);
+    if (!eligible.ok) throw Object.assign(new Error('Discovery is no longer allowed for this account.'), { code: 'ineligible' });
+    let intel = { ...eligible.intel, findings: mergeFindings(eligible.intel.findings, findings), discoveryPending: false, lastRunAt: finishedAt, lastJobId: jobId, lastRunReport: report };
+    intel = cleanIntel(intel);
+    if (intel.autoApproveStrong) intel = autoApproveStrong(intel);
+    await saveIntel(email, intel);
+    return { newCount: intel.findings.filter(f => f.isNew).length };
+  });
+}
+
+const intelQueue = createIntelQueue({
+  store: { getJson, putJson, listKeys },
+  sources: INTEL_SOURCES,
+  isEligible: intelEligibility,
+  commit: commitDiscovery,
+  log: message => console.warn('[personal-intel]', message),
+  config: {
+    tickMs: envNumber('INTEL_WORKER_TICK_MS', 3000), leaseMs: envNumber('INTEL_LEASE_MS', 90000), maxAttempts: envNumber('INTEL_MAX_ATTEMPTS', 4),
+    backoffBaseMs: envNumber('INTEL_BACKOFF_BASE_MS', 5000), maxConcurrent: envNumber('INTEL_MAX_CONCURRENT_JOBS', 2),
+    maxStartsPerHour: envNumber('INTEL_MAX_RUNS_PER_HOUR', 10), sourceTimeoutMs: envNumber('INTEL_SOURCE_TIMEOUT_MS', 15000),
+    autoRetryDelayMs: envNumber('INTEL_AUTO_RETRY_DELAY_MS', 30 * 60e3)
+  }
+});
+/** Queue the first discovery for an eligible account that has never had a job. Safe to call repeatedly (it never duplicates). */
+async function ensureFirstDiscovery(email, intel) {
+  if (!intel?.enabled || intel.paused || !intel.discoveryPending) return;
+  const status = await intelQueue.status(email);
+  if (status.hasHistory || status.active) return;   // already tried: the queue's own retry schedule owns it from here
+  await intelQueue.enqueue(email, { kind: 'signup' });
+}
+const intelPollHits = new Map();
+const intelPollLimited = key => { const n = Date.now(), a = (intelPollHits.get(key) || []).filter(t => n - t < 60e3); a.push(n); intelPollHits.set(key, a); return a.length > 120; };
+
+async function deleteIntelStorageVersions(email) {
+  let total = 0;
+  for (const key of [intelKey(email), jobsKey(email)]) {
+    const versions = [];
+    let keyMarker = '', versionIdMarker = '';
+    do {
+      const page = await listObjectVersions(key, keyMarker, versionIdMarker, 1000);
+      versions.push(...page.versions.filter(item => item.key === key));
+      if (versions.length > 10000) throw new Error('personal_intel_version_limit_exceeded');
+      if (!page.truncated) break;
+      if (!page.nextKeyMarker || !page.nextVersionIdMarker) throw new Error('personal_intel_pagination_failed');
+      keyMarker = page.nextKeyMarker; versionIdMarker = page.nextVersionIdMarker;
+    } while (true);
+    for (let i = 0; i < versions.length; i += 50) {
+      const results = await Promise.allSettled(versions.slice(i, i + 50).map(item => deleteObjectVersion(item.key, item.versionId)));
+      if (results.some(result => result.status === 'rejected')) throw new Error('personal_intel_version_delete_failed');
+    }
+    let verifyKey = '', verifyVersion = '';
+    do {
+      const page = await listObjectVersions(key, verifyKey, verifyVersion, 1000);
+      if (page.versions.some(item => item.key === key)) throw new Error('personal_intel_delete_verification_failed');
+      if (!page.truncated) break;
+      if (!page.nextKeyMarker || !page.nextVersionIdMarker) throw new Error('personal_intel_verification_pagination_failed');
+      verifyKey = page.nextKeyMarker; verifyVersion = page.nextVersionIdMarker;
+    } while (true);
+    total += versions.length;
+  }
+  return total;
+}
+
+const DISCOVERY_REFUSALS = {
+  email_unverified: [403, 'Discovery is only available for accounts whose email ownership has been verified.'],
+  not_enabled: [403, 'Turn on Personal Intelligence discovery first.'],
+  paused: [409, 'Discovery is paused. Resume it to search again.'],
+  account_deleted: [403, 'This account is being deleted.'],
+  no_account: [403, 'Account not found.'],
+  storage_unavailable: [503, 'Private storage is not configured, so Personal Intelligence is unavailable.']
+};
 
 async function handleIntel(req, res, u) {
   const user = await userOf(req);
   if (!user) return json(res, 401, { error: 'Please sign in again.' });
-  if (limited(user.email)) return json(res, 429, { error: 'Slow down a little, then try again.' });
   if (!b2Ready()) return json(res, 503, { error: 'Private storage is not configured, so Personal Intelligence is unavailable.' });
   // Everything below is keyed by the signed-in account's own email. No route accepts another account's id or email.
   const email = user.email, path = u.pathname.replace(/\/+$/, '');
+  // Live progress is read-only and cheap, so it has its own generous limit and answers from the job document alone.
+  if (req.method === 'GET' && path === '/api/intel/discovery') {
+    if (intelPollLimited(email)) return json(res, 429, { code: 'slow_down', error: 'Progress is being checked too often. It will keep updating automatically.' });
+    try { return json(res, 200, { discovery: await intelQueue.status(email) }); }
+    catch (e) { console.error('personal intel progress failed:', e?.message || e); return json(res, 502, { error: 'Progress could not be read right now.' }); }
+  }
+  if (limited(user.email)) return json(res, 429, { error: 'Slow down a little, then try again.' });
   try {
     let account = await getJson(userKey(email));
-    const verified = account?.emailVerified === true;
+    let verified = account?.emailVerified === true;
     let intel = cleanIntel(await getJson(intelKey(email)));
     // Recover a saved signup opt-in if writing the initial intelligence object failed during OAuth.
     if (verified && account?.personalIntelOptIn === true && typeof account.personalIntelAdultConfirmedAt === 'string' && !intel.adultConfirmedAt) {
@@ -1800,106 +1885,138 @@ async function handleIntel(req, res, u) {
     }
     // A missing account-level opt-in or adult confirmation always overrides a stale profile object.
     if (intel.enabled && (account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt || !intel.adultConfirmedAt)) {
-      intel.enabled = false; intel.autoApproveStrong = false; intel.discoveryPending = false;
+      intel.enabled = false; intel.paused = false; intel.autoApproveStrong = false; intel.discoveryPending = false;
       await saveIntel(email, intel);
+      await intelQueue.cancel(email, 'not_enabled');
       if (account && (account.personalIntelOptIn === true || account.personalIntelAdultConfirmedAt)) {
         const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account;
         await putJson(userKey(email), accountRest);
         account = accountRest;
       }
     }
-    if (req.method === 'GET' && path === '/api/intel') return json(res, 200, intelView(intel, verified, account));
+    const view = async () => {
+      let discovery = null;
+      try { discovery = await intelQueue.status(email); } catch (e) { console.warn('personal intel progress unavailable:', e?.message || e); }
+      return { ...intelView(intel, verified, account), discovery };
+    };
+    if (req.method === 'GET' && path === '/api/intel') {
+      // Safety net on the SERVER: an eligible account whose first discovery was never queued gets it queued now.
+      try { await ensureFirstDiscovery(email, intel); } catch (e) { console.warn('first discovery could not be queued yet:', e?.message || e); }
+      return json(res, 200, await view());
+    }
     if (req.method === 'DELETE' && path === '/api/intel') {
-      if (account) {
-        const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account;
-        await putJson(userKey(email), accountRest);
-        account = accountRest;
-      }
-      // Disable AI use before attempting the permanent version purge. If deletion fails,
-      // the user sees an error and can retry, but the old profile is not used meanwhile.
-      intel = { ...intel, enabled: false, autoApproveStrong: false, discoveryPending: false };
-      intelCache.set(email, { intel, at: Date.now() });
-      await saveIntel(email, intel);
+      await withIntelLock(email, async () => {
+        const fresh = await getJson(userKey(email));
+        if (fresh) {
+          const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = fresh;
+          await putJson(userKey(email), accountRest);
+        }
+        // Disable AI use before attempting the permanent version purge. If deletion fails,
+        // the user sees an error and can retry, but the old profile is not used meanwhile.
+        const current = cleanIntel(await getJson(intelKey(email)));
+        const disabled = { ...current, enabled: false, paused: false, autoApproveStrong: false, discoveryPending: false };
+        intelCache.set(email, { intel: disabled, at: Date.now() });
+        await saveIntel(email, disabled);
+      });
+      await intelQueue.cancel(email, 'deleted', { wait: true });
       const deletedVersions = await deleteIntelStorageVersions(email);
-      intelCache.delete(email); intelRuns.delete(email);
+      intelCache.delete(email);
       return json(res, 200, { ok: true, deleted: true, deletedVersions });
     }
     if (req.method !== 'POST' && req.method !== 'PUT' && req.method !== 'DELETE') return json(res, 405, { error: 'Method not allowed.' });
     let body = {};
     if (req.method !== 'DELETE') { try { body = await readBody(req, 20000); } catch { return json(res, 400, { error: 'That request could not be read.' }); } }
-    if (path === '/api/intel/settings' && req.method === 'POST') {
-       if (typeof body.autoApproveStrong !== 'boolean') return json(res, 400, { error: 'autoApproveStrong must be true or false.' });
-       if (body.autoApproveStrong && (!verified || !intel.enabled || account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt || !intel.adultConfirmedAt)) {
-         return json(res, 403, { code: !verified ? 'email_unverified' : 'not_enabled', error: 'Enable verified Personal Intelligence discovery before turning on automatic approval.' });
-       }
-       intel.autoApproveStrong = body.autoApproveStrong;
-       if (intel.autoApproveStrong) intel = autoApproveStrong(intel);
-       else if (account?.personalIntelAutoApproveStrong === true) { const { personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account; await putJson(userKey(email), accountRest); account = accountRest; }
-       await saveIntel(email, intel);
-       return json(res, 200, intelView(intel, verified, account));
-     }
-     if (path === '/api/intel/consent') {
-      if (body.enable === true) {
-        if (body.acknowledge !== true) return json(res, 400, { error: 'Please confirm you understand what will be searched.' });
-        if (body.adultConfirmed !== true) return json(res, 400, { code: 'adult_confirmation_required', error: 'Personal Intelligence discovery is available only to people who confirm they are 18 or older.' });
-        if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified (for example by signing in with Google).' });
-        const now = new Date().toISOString();
-        intel = { ...intel, enabled: true, consentAt: now, adultConfirmedAt: now, discoveryPending: true };
-        if (account) { account = { ...account, personalIntelOptIn: true, personalIntelAdultConfirmedAt: now }; await putJson(userKey(email), account); }
-      } else {
-        intel = { ...intel, enabled: false, autoApproveStrong: false, discoveryPending: false };
-        if (account) {
-          const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account;
-          await putJson(userKey(email), accountRest);
-          account = accountRest;
-        }
-      }
-      await saveIntel(email, intel);
-      return json(res, 200, intelView(intel, verified, account));
+
+    if (path === '/api/intel/discovery/cancel' && req.method === 'POST') {
+      await intelQueue.cancel(email, 'user');
+      return json(res, 200, await view());
+    }
+    if (path === '/api/intel/discovery/ack' && req.method === 'POST') {
+      await intelQueue.acknowledge(email);
+      return json(res, 200, await view());
     }
     if (path === '/api/intel/discover' && req.method === 'POST') {
-      if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified.' });
-      if (!intel.enabled || account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt) return json(res, 403, { code: 'not_enabled', error: 'Turn on Personal Intelligence discovery first.' });
-      if (!intel.adultConfirmedAt) return json(res, 403, { code: 'adult_confirmation_required', error: 'Confirm that you are 18 or older before discovery can run.' });
-      if (intelInFlight.has(email)) return json(res, 409, { code: 'discovery_in_progress', error: 'A discovery run is already in progress for this account. Please wait for it to finish.' });
-      const last = intelRuns.get(email) || 0;
-      if (Date.now() - last < 10 * 60e3) {
-        const seconds = Math.ceil((10 * 60e3 - (Date.now() - last)) / 1000);
-        return json(res, 429, { code: 'rate_limited', retryAfterSeconds: seconds, error: 'A successful discovery ran recently. You can run another search in about ' + Math.ceil(seconds / 60) + ' minute' + (Math.ceil(seconds / 60) === 1 ? '' : 's') + '.' });
+      // Asking again is always allowed. If a search is already running the caller simply joins it; there is no cooldown.
+      const eligible = await intelEligibility(email);
+      if (!eligible.ok) {
+        if (eligible.reason === 'not_enabled' && verified && intel.enabled && !intel.adultConfirmedAt) return json(res, 403, { code: 'adult_confirmation_required', error: 'Confirm that you are 18 or older before discovery can run.' });
+        const [code, error] = DISCOVERY_REFUSALS[eligible.reason] || [403, 'Discovery is not available for this account.'];
+        return json(res, code, { code: eligible.reason, error });
       }
-      intelInFlight.add(email);
-      try {
-        const { findings, report } = await discover(email);
-        // Failed or unconfigured providers must not consume the ten-minute cooldown.
-        // Keep a queued first run pending so the app can automatically retry on its next open.
-        const sourceSucceeded = report.some(item => item.status === 'ok');
-        const completedAt = new Date().toISOString();
-        intel = { ...intel, findings: mergeFindings(intel.findings, findings), discoveryPending: !sourceSucceeded, lastRunAt: sourceSucceeded ? completedAt : intel.lastRunAt, lastRunReport: report };
-        intel = cleanIntel(intel);
+      const queued = await intelQueue.enqueue(email, { kind: 'manual' });
+      if (!queued.ok) { const [code, error] = DISCOVERY_REFUSALS[queued.reason] || [403, 'Discovery is not available for this account.']; return json(res, code, { code: queued.reason, error }); }
+      return json(res, queued.created ? 202 : 200, { ...(await view()), request: queued.created ? 'started' : 'already_running' });
+    }
+
+    // Everything below changes the profile document: do it under the account's lock, on a fresh copy,
+    // so a background save that just finished is never overwritten by a stale read.
+    return await withIntelLock(email, async () => {
+      account = await getJson(userKey(email));
+      verified = account?.emailVerified === true;
+      intel = cleanIntel(await getJson(intelKey(email)));
+      if (path === '/api/intel/settings' && req.method === 'POST') {
+        if (typeof body.autoApproveStrong !== 'boolean') return json(res, 400, { error: 'autoApproveStrong must be true or false.' });
+        if (body.autoApproveStrong && (!verified || !intel.enabled || account?.personalIntelOptIn !== true || !account?.personalIntelAdultConfirmedAt || !intel.adultConfirmedAt)) {
+          return json(res, 403, { code: !verified ? 'email_unverified' : 'not_enabled', error: 'Enable verified Personal Intelligence discovery before turning on automatic approval.' });
+        }
+        intel.autoApproveStrong = body.autoApproveStrong;
         if (intel.autoApproveStrong) intel = autoApproveStrong(intel);
+        else if (account?.personalIntelAutoApproveStrong === true) { const { personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account; await putJson(userKey(email), accountRest); account = accountRest; }
         await saveIntel(email, intel);
-        if (sourceSucceeded) intelRuns.set(email, Date.now());
-        return json(res, 200, intelView(intel, verified, account));
-      } finally {
-        intelInFlight.delete(email);
+        return json(res, 200, await view());
       }
-    }
-    const m = path.match(/^\/api\/intel\/findings\/([a-f0-9]{16})$/);
-    if (m) {
-      if (req.method === 'DELETE') { if (!removeFinding(intel, m[1])) return json(res, 404, { error: 'Finding not found.' }); }
-      else {
-        if (!['approved', 'rejected', 'pending'].includes(body.status)) return json(res, 400, { error: 'Status must be approved, rejected or pending.' });
-        if (!applyApproval(intel, m[1], body.status)) return json(res, 404, { error: 'Finding not found.' });
+      if (path === '/api/intel/pause' && req.method === 'POST') {
+        if (typeof body.paused !== 'boolean') return json(res, 400, { error: 'paused must be true or false.' });
+        if (!intel.enabled) return json(res, 403, { code: 'not_enabled', error: 'Turn on Personal Intelligence discovery first.' });
+        intel.paused = body.paused;
+        await saveIntel(email, intel);
+        if (intel.paused) await intelQueue.cancel(email, 'paused');            // stops a queued or running job without saving its partial results
+        else await ensureFirstDiscovery(email, intel);
+        return json(res, 200, await view());
       }
-      await saveIntel(email, intel);
-      return json(res, 200, intelView(intel, verified, account));
-    }
-    if (path === '/api/intel/profile' && (req.method === 'PUT' || req.method === 'POST')) {
-      intel.profile = cleanProfile(body.profile);
-      await saveIntel(email, intel);
-      return json(res, 200, intelView(intel, verified, account));
-    }
-    return json(res, 404, { error: 'Not found.' });
+      if (path === '/api/intel/consent') {
+        if (body.enable === true) {
+          if (body.acknowledge !== true) return json(res, 400, { error: 'Please confirm you understand what will be searched.' });
+          if (body.adultConfirmed !== true) return json(res, 400, { code: 'adult_confirmation_required', error: 'Personal Intelligence discovery is available only to people who confirm they are 18 or older.' });
+          if (!verified) return json(res, 403, { code: 'email_unverified', error: 'Discovery is only available for accounts whose email ownership has been verified (for example by signing in with Google).' });
+          const now = new Date().toISOString();
+          intel = { ...intel, enabled: true, paused: false, consentAt: now, adultConfirmedAt: now, discoveryPending: true };
+          if (account) { account = { ...account, personalIntelOptIn: true, personalIntelAdultConfirmedAt: now }; await putJson(userKey(email), account); }
+          await saveIntel(email, intel);
+          // The server starts the first search itself; the browser does not have to stay open or call anything else.
+          try { await intelQueue.enqueue(email, { kind: 'enable' }); } catch (e) { console.warn('first discovery could not be queued yet:', e?.message || e); }
+        } else {
+          intel = { ...intel, enabled: false, paused: false, autoApproveStrong: false, discoveryPending: false };
+          if (account) {
+            const { personalIntelOptIn: _optIn, personalIntelAdultConfirmedAt: _adultAt, personalIntelAutoApproveStrong: _autoApprove, ...accountRest } = account;
+            await putJson(userKey(email), accountRest);
+            account = accountRest;
+          }
+          await saveIntel(email, intel);
+          await intelQueue.cancel(email, 'disabled');          // consent is gone first, so a job mid-flight can never save
+        }
+        return json(res, 200, await view());
+      }
+      const m = path.match(/^\/api\/intel\/findings\/([a-f0-9]{16})$/);
+      if (m) {
+        if (req.method === 'DELETE') { if (!removeFinding(intel, m[1])) return json(res, 404, { error: 'Finding not found.' }); }
+        else if (req.method === 'PUT') {
+          if (!Array.isArray(body.facts) || body.facts.length > 20) return json(res, 400, { error: 'Send up to 20 details to keep for this finding.' });
+          if (!editFindingFacts(intel, m[1], body.facts)) return json(res, 404, { error: 'Finding not found.' });
+        } else {
+          if (!['approved', 'rejected', 'pending'].includes(body.status)) return json(res, 400, { error: 'Status must be approved, rejected or pending.' });
+          if (!applyApproval(intel, m[1], body.status)) return json(res, 404, { error: 'Finding not found.' });
+        }
+        await saveIntel(email, intel);
+        return json(res, 200, await view());
+      }
+      if (path === '/api/intel/profile' && (req.method === 'PUT' || req.method === 'POST')) {
+        intel.profile = cleanProfile(body.profile);
+        await saveIntel(email, intel);
+        return json(res, 200, await view());
+      }
+      return json(res, 404, { error: 'Not found.' });
+    });
   } catch (e) {
     console.error('personal intel failed:', e?.message || e);
     return json(res, 502, { error: 'Personal Intelligence storage could not be reached. Please try again.' });
@@ -2084,10 +2201,11 @@ http.createServer(async (req, res) => {
         // It contains no email, password, profile, or conversation content.
         await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: false, accountId: session.accountId || currentRecord?.accountId || null, version: 2 });
         accountAuthCache.set(email, { allowed: false, until: Date.now() + 60 * 60e3 });
+        // Stop queued or running discovery first (and wait for it), so no job can write to the data being purged.
+        await intelQueue.cancel(email, 'account_deleted', { wait: true });
         const deletedVersions = await deleteAccountStorageVersions(email, digest);
         await putJson(tombstoneKey, { deletedAt: new Date().toISOString(), deletionComplete: true, accountId: session.accountId || currentRecord?.accountId || null, deletedVersions, version: 2 });
         intelCache.delete(email);
-        intelRuns.delete(email);
         answerCache.delete(email);
         seenCache.delete(email);
         plannerWriteQueues.delete(email);
@@ -2151,3 +2269,13 @@ http.createServer(async (req, res) => {
     }
   }
 }).listen(process.env.PORT || 3000);
+
+/* Start the discovery worker: recovers unfinished jobs from storage, then claims due jobs on a timer. It runs in this process, not in a browser. */
+if (b2Ready() && process.env.INTEL_WORKER_DISABLED !== '1') {
+  void intelQueue.start();
+  for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
+    // Hand running jobs straight back to the queue so the next process continues them immediately.
+    const force = setTimeout(() => process.exit(0), 4000); force.unref?.();
+    intelQueue.shutdown().finally(() => process.exit(0));
+  });
+}
