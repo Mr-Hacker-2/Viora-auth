@@ -105,3 +105,23 @@ Routes (all require the signed-in session; every route reads or writes only the 
 - One discovery run per account every 10 minutes (in-memory). Findings remain pending until the user approves them. Approval adds editable profile facts. Only approved, request-relevant profile items (max 8) are added to the chat system prompt; Humanizer receives none.
 - The About you & Memory dialog shows the approved profile summary. The full dashboard lets users review, reject, correct, disable, or delete discoveries. Disabling removes AI access and stops future discovery.
 - Profile deletion permanently removes all B2 versions and delete markers for that account's Personal Intelligence object and clears the account's saved opt-in. Account deletion also removes the Personal Intelligence object.
+
+## Personal Intelligence background discovery
+
+Discovery is a persistent server-side job (`intel-jobs.js`), not a browser action. The browser requests a run and watches progress; the server does the work.
+
+- **Storage:** one private document per account, `intel/<sha256(email)>.jobs.json`, in the existing B2 bucket (so account deletion, "delete my profile" and the admin storage tools cover it). It holds job state, per-source results and retry schedule. Nothing runs from an in-memory Map, a timer in the browser, or an open page.
+- **Queue rules:** at most one active job per account. Asking while one is active joins it (`200`, `request: "already_running"`); asking after it finished starts a fresh one immediately (`202`, `request: "started"`). There is no user-facing cooldown.
+- **Automatic first run:** when a verified account with an explicit, adult-confirmed opt-in is created or verified (Google sign-up, Google verification of a password account, or turning discovery on), the server queues the first job itself. `GET /api/intel` also queues it if it was somehow never queued.
+- **Worker:** an in-process loop (`INTEL_WORKER_TICK_MS`) claims due jobs with a lease. After a restart, `recover()` re-reads the job documents; a job whose lease expired is resumed, and sources that already finished are not asked again. SIGTERM hands running jobs back to the queue.
+- **Retries:** per source. Temporary errors (network, timeouts, 429, 5xx, GitHub rate limits) use exponential backoff with jitter; `Retry-After` / `x-ratelimit-reset` is honoured exactly; permanent errors (other 4xx, missing key) are never retried. A failed first run is retried automatically later (up to 3 times, doubling delay).
+- **Commit:** only the final step touches the profile, under the account's lock, after re-checking consent, verification, pause state and deletion. Failed, cancelled or partial runs never overwrite existing data. Findings are merged by canonical URL; user decisions and edits are kept; uncertain findings are never auto-approved.
+- **Abuse protection:** a per-account start budget (`INTEL_MAX_RUNS_PER_HOUR`, default 10) *delays* excess jobs instead of refusing them, a global concurrency cap (`INTEL_MAX_CONCURRENT_JOBS`), and the existing request limiter.
+- **Stopping:** turning discovery off, pausing, deleting the profile or deleting the account cancels queued/running jobs (aborting provider calls) and discards partial results.
+
+Routes (all Bearer-authenticated, always scoped to the caller's own account):
+`GET /api/intel` (state + `discovery`), `GET /api/intel/discovery` (live progress), `POST /api/intel/discover`, `POST /api/intel/discovery/cancel`, `POST /api/intel/discovery/ack`, `POST /api/intel/pause {paused}`, `POST /api/intel/consent`, `POST /api/intel/settings`, `POST|PUT|DELETE /api/intel/findings/:id` (approve/reject/pending, edit `facts`, delete), `PUT /api/intel/profile`, `DELETE /api/intel`.
+
+Optional environment variables (defaults in brackets): `GITHUB_TOKEN`, `GRAVATAR_API_KEY`, `BRAVE_SEARCH_API_KEY` (provider keys, backend only), `INTEL_WORKER_DISABLED=1` (turn the worker off), `INTEL_WORKER_TICK_MS` [3000], `INTEL_LEASE_MS` [90000], `INTEL_MAX_ATTEMPTS` [4], `INTEL_BACKOFF_BASE_MS` [5000], `INTEL_MAX_CONCURRENT_JOBS` [2], `INTEL_MAX_RUNS_PER_HOUR` [10], `INTEL_SOURCE_TIMEOUT_MS` [15000], `INTEL_AUTO_RETRY_DELAY_MS` [1800000].
+
+Limitations: the job lease is read-modify-write on object storage (no compare-and-swap), so it is designed for one server process (the current Render deployment); a second process could duplicate provider calls but cannot duplicate findings. The service must stay running for the worker to run; on hosts that sleep idle instances, jobs resume on the next wake-up.

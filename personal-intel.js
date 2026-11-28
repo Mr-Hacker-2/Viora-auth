@@ -10,7 +10,10 @@
          Requires BRAVE_SEARCH_API_KEY. Without it this source is reported as "not configured" and returns nothing.
 
    Every finding records its source, URL, why it was matched, and a confidence label. Nothing reaches the user's
-   profile or the AI until the user approves it. */
+   profile or the AI until the user approves it (or, if the user separately opted in, a STRONG finding is auto-approved;
+   possible and uncertain findings are never auto-approved).
+
+   Running discovery in the background (queue, retries, progress) lives in intel-jobs.js; this file stays pure. */
 import crypto from 'node:crypto';
 
 export const CATEGORIES = ['interests', 'skills', 'projects', 'learning', 'achievements', 'background', 'topics', 'goals'];
@@ -20,10 +23,25 @@ const clip = (v, n = MAX_TEXT) => String(v ?? '').replace(/[\u0000-\u001f\u007f]
 const httpsUrl = v => { try { const u = new URL(String(v)); return u.protocol === 'https:' ? u.href.slice(0, 500) : ''; } catch { return ''; } };
 const sha256 = v => crypto.createHash('sha256').update(String(v).trim().toLowerCase()).digest('hex');
 export const intelKey = email => `intel/${sha256(email)}.json`;
-const findingId = (source, url) => crypto.createHash('sha256').update(source + '|' + url).digest('hex').slice(0, 16);
+const TRACKING_PARAM = /^(utm_|fbclid$|gclid$|ref$|ref_src$|mc_)/i;
+/** One stable key per public page: same page reached through different sources or tracking links is one finding. */
+export function canonicalUrl(value) {
+  try {
+    const u = new URL(String(value));
+    if (u.protocol !== 'https:') return '';
+    u.hash = '';
+    u.hostname = u.hostname.toLowerCase().replace(/^www\./, '');
+    for (const k of [...u.searchParams.keys()]) if (TRACKING_PARAM.test(k)) u.searchParams.delete(k);
+    u.searchParams.sort();
+    u.pathname = u.pathname.replace(/\/+$/, '') || '/';
+    return u.href;
+  } catch { return ''; }
+}
+const findingId = (url) => crypto.createHash('sha256').update(canonicalUrl(url) || String(url)).digest('hex').slice(0, 16);
+const CONF_RANK = { uncertain: 0, possible: 1, strong: 2 };
 
 export function emptyIntel() {
-  return { version: 1, enabled: false, autoApproveStrong: false, consentAt: null, adultConfirmedAt: null, discoveryPending: false, lastRunAt: null, lastRunReport: null, findings: [], profile: Object.fromEntries(CATEGORIES.map(c => [c, []])), factSources: [] };
+  return { version: 1, enabled: false, paused: false, autoApproveStrong: false, consentAt: null, adultConfirmedAt: null, discoveryPending: false, lastRunAt: null, lastJobId: null, lastRunReport: null, findings: [], profile: Object.fromEntries(CATEGORIES.map(c => [c, []])), factSources: [] };
 }
 
 /** Normalise stored or user-sent data so nothing unexpected survives a round trip. */
@@ -31,6 +49,8 @@ export function cleanIntel(raw) {
   const out = emptyIntel();
   if (!raw || typeof raw !== 'object') return out;
   out.enabled = raw.enabled === true;
+  out.paused = out.enabled && raw.paused === true;
+  out.lastJobId = typeof raw.lastJobId === 'string' ? raw.lastJobId.slice(0, 64) : null;
   out.autoApproveStrong = raw.autoApproveStrong === true && out.enabled;
   out.factSources = Array.isArray(raw.factSources) ? raw.factSources.slice(0, 2000).map(x => ({ category: CATEGORIES.includes(x?.category) ? x.category : 'topics', text: clip(x?.text), findingIds: Array.isArray(x?.findingIds) ? [...new Set(x.findingIds.filter(id => /^[a-f0-9]{16}$/.test(id)))].slice(0, MAX_FINDINGS) : [] })).filter(x => x.text && x.findingIds.length) : [];
   out.consentAt = typeof raw.consentAt === 'string' ? raw.consentAt : null;
@@ -43,18 +63,32 @@ export function cleanIntel(raw) {
   return out;
 }
 
+const cleanFacts = list => {
+  const seen = new Set(), out = [];
+  for (const x of Array.isArray(list) ? list.slice(0, 40) : []) {
+    const fact = { category: CATEGORIES.includes(x?.category) ? x.category : 'topics', text: clip(x?.text, MAX_TEXT) };
+    const key = factKey(fact.category, fact.text);
+    if (fact.text && !seen.has(key)) { seen.add(key); out.push(fact); }
+  }
+  return out.slice(0, 20);
+};
+
 function cleanFinding(f) {
   const url = httpsUrl(f?.url);
   if (!url) return null;
+  const source = clip(f.source, 40);
   return {
-    id: /^[a-f0-9]{16}$/.test(f.id) ? f.id : findingId(clip(f.source, 40), url),
-    source: clip(f.source, 40), url, title: clip(f.title, 160), snippet: clip(f.snippet, 400),
-    matchBasis: clip(f.matchBasis, 200),
+    id: /^[a-f0-9]{16}$/.test(f.id) ? f.id : findingId(url),
+    source, sources: [...new Set([source, ...(Array.isArray(f.sources) ? f.sources.map(x => clip(x, 40)) : [])].filter(Boolean))].slice(0, 6),
+    url, title: clip(f.title, 160), snippet: clip(f.snippet, 400),
+    matchBasis: clip(f.matchBasis, 400),
     confidence: ['strong', 'possible', 'uncertain'].includes(f.confidence) ? f.confidence : 'uncertain',
     status: ['pending', 'approved', 'rejected'].includes(f.status) ? f.status : 'pending',
-    facts: Array.isArray(f.facts) ? f.facts.slice(0, 20).map(x => ({ category: CATEGORIES.includes(x?.category) ? x.category : 'topics', text: clip(x?.text, MAX_TEXT) })).filter(x => x.text) : [],
+    facts: cleanFacts(f.facts),
     foundAt: typeof f.foundAt === 'string' ? f.foundAt : new Date().toISOString(),
-    autoApproved: f.autoApproved === true && f.status === 'approved'
+    autoApproved: f.autoApproved === true && f.status === 'approved',
+    isNew: f.isNew === true,
+    edited: f.edited === true
   };
 }
 
@@ -67,16 +101,59 @@ export function cleanProfile(p) {
   return out;
 }
 
-/** Merge newly discovered findings. Existing decisions (approved/rejected) are kept; nothing is auto-approved. */
+/** Combine findings that point at the same public page (from one or several sources) into one carefully merged finding.
+    Corroboration by a second independent source can lift "uncertain" to "possible", but never to "strong":
+    an email match, however often it repeats, is not proof that a profile belongs to the user. */
+export function reviewFindings(raw) {
+  const groups = new Map();
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const f = cleanFinding({ ...item, id: undefined });
+    if (!f) continue;
+    const key = canonicalUrl(f.url);
+    const g = groups.get(key);
+    if (!g) { groups.set(key, { ...f }); continue; }
+    const better = CONF_RANK[f.confidence] > CONF_RANK[g.confidence];
+    g.sources = [...new Set([...g.sources, ...f.sources])].slice(0, 6);
+    g.facts = cleanFacts([...g.facts, ...f.facts]);
+    if (better) { g.confidence = f.confidence; g.matchBasis = f.matchBasis; g.source = f.source; g.title = f.title || g.title; }
+    if (!g.title) g.title = f.title;
+    if ((f.snippet || '').length > (g.snippet || '').length) g.snippet = f.snippet;
+  }
+  const out = [];
+  for (const g of groups.values()) {
+    if (g.sources.length > 1) {
+      if (g.confidence === 'uncertain') g.confidence = 'possible';
+      const others = g.sources.filter(x => x !== g.source);
+      g.matchBasis = clip(g.matchBasis + ' The same page was also reported by ' + others.join(', ') + '.', 400);
+    }
+    out.push(g);
+  }
+  return out.sort((a, b) => CONF_RANK[b.confidence] - CONF_RANK[a.confidence]);
+}
+
+/** Merge newly discovered findings into the stored list. Existing decisions (approved/rejected) and edits are kept,
+    new pages are flagged isNew, and nothing is auto-approved here. */
 export function mergeFindings(existing, incoming) {
-  const byId = new Map(existing.map(f => [f.id, f]));
+  const list = existing.map(f => ({ ...f, isNew: false }));
+  const byCanon = new Map(list.map(f => [canonicalUrl(f.url) || f.url, f]));
   for (const raw of incoming) {
     const f = cleanFinding(raw);
     if (!f) continue;
-    const old = byId.get(f.id);
-    byId.set(f.id, old ? { ...f, status: old.status, foundAt: old.foundAt, autoApproved: old.autoApproved === true && old.status === 'approved' } : f);
+    const old = byCanon.get(canonicalUrl(f.url) || f.url) || list.find(x => x.id === f.id);
+    if (old) {
+      const keep = old.status === 'approved' || old.edited;
+      Object.assign(old, { ...f, id: old.id, status: old.status, foundAt: old.foundAt, autoApproved: old.autoApproved === true && old.status === 'approved', isNew: false, edited: old.edited,
+        facts: keep ? old.facts : f.facts, confidence: old.status === 'approved' ? old.confidence : f.confidence, sources: [...new Set([...(old.sources || []), ...f.sources])].slice(0, 6) });
+    } else {
+      const fresh = { ...f, isNew: true };
+      list.push(fresh); byCanon.set(canonicalUrl(fresh.url) || fresh.url, fresh);
+    }
   }
-  return [...byId.values()].slice(0, MAX_FINDINGS);
+  while (list.length > MAX_FINDINGS) {
+    const drop = list.findIndex(f => f.status === 'rejected');
+    list.splice(drop >= 0 ? drop : 0, 1);
+  }
+  return list;
 }
 
 function factKey(category, text) { return category + '|' + String(text).toLowerCase(); }
@@ -127,7 +204,19 @@ export function applyApproval(intel, id, status) {
   if (f.status === 'approved' && status !== 'approved') removeFindingFacts(intel, f);
   f.status = status;
   f.autoApproved = false;
+  f.isNew = false;
   if (status === 'approved') addFindingFacts(intel, f);
+  return intel;
+}
+
+/** The user may correct what a finding would add before (or after) approving it. Approved facts are swapped in place. */
+export function editFindingFacts(intel, id, facts) {
+  const f = intel.findings.find(x => x.id === id);
+  if (!f) return null;
+  const next = cleanFacts(facts);
+  if (f.status === 'approved') removeFindingFacts(intel, f);
+  f.facts = next; f.edited = true; f.isNew = false;
+  if (f.status === 'approved') addFindingFacts(intel, f);
   return intel;
 }
 
@@ -139,19 +228,61 @@ export function removeFinding(intel, id) {
   return true;
 }
 
+/* ---------------- provider errors: temporary vs permanent ---------------- */
+/** Seconds or an HTTP date from Retry-After; GitHub also reports x-ratelimit-reset when the quota is spent. Returns ms or null. */
+export function parseRetryAfter(headers, now = Date.now()) {
+  const get = n => { try { return typeof headers?.get === 'function' ? headers.get(n) : (headers?.[n] ?? null); } catch { return null; } };
+  const ra = get('retry-after');
+  if (ra != null && String(ra).trim() !== '') {
+    const secs = Number(ra);
+    if (Number.isFinite(secs)) return Math.max(0, Math.round(secs * 1000));
+    const at = Date.parse(ra);
+    if (Number.isFinite(at)) return Math.max(0, at - now);
+  }
+  const reset = get('x-ratelimit-reset'), left = get('x-ratelimit-remaining');
+  if (reset != null && String(left) === '0') {
+    const at = Number(reset) * 1000;
+    if (Number.isFinite(at)) return Math.max(0, at - now);
+  }
+  return null;
+}
+/** An Error carrying how the queue should treat it: retryable (with optional Retry-After) or permanent. */
+export function httpFailure(name, r, { rateLimitedOn403 = false } = {}) {
+  const status = r.status, retryAfterMs = parseRetryAfter(r.headers);
+  const limited = status === 429 || (status === 403 && (retryAfterMs !== null || rateLimitedOn403));
+  const retryable = limited || status === 408 || status >= 500;
+  const code = limited ? 'rate_limited' : retryable ? 'temporary' : (status === 401 || status === 403) ? 'unauthorized' : 'rejected';
+  return Object.assign(new Error(limited ? name + ' rate limit reached' : name + ' answered ' + status), { code, status, retryable, retryAfterMs });
+}
+const NETWORK_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']);
+/** Normalise anything a source throws into { code, retryable, retryAfterMs, message }. Unknown errors are permanent so nothing loops forever. */
+export function classifyError(e) {
+  if (typeof e?.retryable === 'boolean') return { code: e.code || (e.retryable ? 'temporary' : 'error'), retryable: e.retryable, retryAfterMs: Number.isFinite(e.retryAfterMs) ? e.retryAfterMs : null, message: clip(e.message, 160) };
+  if (e?.code === 'not_configured') return { code: 'not_configured', retryable: false, retryAfterMs: null, message: clip(e.message, 160) };
+  if (e?.name === 'TimeoutError' || e?.name === 'AbortError') return { code: 'timeout', retryable: true, retryAfterMs: null, message: 'The source did not answer in time.' };
+  if (e instanceof TypeError || NETWORK_CODES.has(e?.code) || NETWORK_CODES.has(e?.cause?.code)) return { code: 'network', retryable: true, retryAfterMs: null, message: 'The source could not be reached.' };
+  return { code: e?.code || 'error', retryable: false, retryAfterMs: null, message: clip(e?.message || 'Unexpected error', 160) };
+}
+
 /* ---------------- source adapters ---------------- */
 const ghHeaders = token => ({ Accept: 'application/vnd.github+json', 'User-Agent': 'Viora-PersonalIntelligence', 'X-GitHub-Api-Version': '2022-11-28', ...(token ? { Authorization: 'Bearer ' + token } : {}) });
+
+async function githubFailure(r) {
+  // A 403 from GitHub is usually a rate limit, but can also be a real refusal; the message tells them apart.
+  let text = '';
+  if (r.status === 403) { try { text = typeof r.text === 'function' ? await r.text() : JSON.stringify(await r.json()); } catch {} }
+  return httpFailure('GitHub', r, { rateLimitedOn403: /rate limit|abuse|secondary/i.test(text) });
+}
 
 export async function searchGitHub(email, { fetchImpl = fetch, token = process.env.GITHUB_TOKEN, signal } = {}) {
   const q = encodeURIComponent(`${email} in:email`);
   const r = await fetchImpl(`https://api.github.com/search/users?q=${q}&per_page=3`, { headers: ghHeaders(token), signal });
-  if (r.status === 403 || r.status === 429) throw Object.assign(new Error('GitHub rate limit reached'), { code: 'rate_limited' });
-  if (!r.ok) throw new Error('GitHub answered ' + r.status);
+  if (!r.ok) throw await githubFailure(r);
   const data = await r.json();
   const findings = [];
   for (const item of (data.items || []).slice(0, 3)) {
     const ur = await fetchImpl(`https://api.github.com/users/${encodeURIComponent(item.login)}`, { headers: ghHeaders(token), signal });
-    if (!ur.ok) continue;
+    if (!ur.ok) { if (ur.status === 429 || ur.status >= 500 || ur.status === 403) throw await githubFailure(ur); continue; }
     const u = await ur.json();
     const publicEmailMatches = String(u.email || '').toLowerCase() === email;
     const facts = [];
@@ -177,8 +308,7 @@ export async function searchGitHub(email, { fetchImpl = fetch, token = process.e
 export async function searchGravatar(email, { fetchImpl = fetch, apiKey = process.env.GRAVATAR_API_KEY, signal } = {}) {
   const r = await fetchImpl(`https://api.gravatar.com/v3/profiles/${sha256(email)}`, { headers: { Accept: 'application/json', ...(apiKey ? { Authorization: 'Bearer ' + apiKey } : {}) }, signal });
   if (r.status === 404) return [];
-  if (r.status === 429) throw Object.assign(new Error('Gravatar rate limit reached'), { code: 'rate_limited' });
-  if (!r.ok) throw new Error('Gravatar answered ' + r.status);
+  if (!r.ok) throw httpFailure('Gravatar', r);
   const p = await r.json();
   const facts = [];
   if (p.job_title || p.company) facts.push({ category: 'background', text: [p.job_title, p.company].filter(Boolean).join(' at ') });
@@ -201,8 +331,7 @@ export async function searchGravatar(email, { fetchImpl = fetch, apiKey = proces
 export async function searchBrave(email, { fetchImpl = fetch, apiKey = process.env.BRAVE_SEARCH_API_KEY, signal } = {}) {
   if (!apiKey) throw Object.assign(new Error('BRAVE_SEARCH_API_KEY is not set'), { code: 'not_configured' });
   const r = await fetchImpl(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent('"' + email + '"')}&count=10&safesearch=strict`, { headers: { Accept: 'application/json', 'X-Subscription-Token': apiKey }, signal });
-  if (r.status === 429) throw Object.assign(new Error('Brave Search rate limit reached'), { code: 'rate_limited' });
-  if (!r.ok) throw new Error('Brave Search answered ' + r.status);
+  if (!r.ok) throw httpFailure('Brave Search', r);
   const data = await r.json();
   return (data.web?.results || []).slice(0, 10).map(x => {
     const text = (String(x.title || '') + ' ' + String(x.description || '')).toLowerCase();
@@ -212,9 +341,9 @@ export async function searchBrave(email, { fetchImpl = fetch, apiKey = process.e
 }
 
 export const SOURCES = [
-  { id: 'github', label: 'GitHub public profiles', run: searchGitHub, configured: () => true, note: () => process.env.GITHUB_TOKEN ? '' : 'Works without a key; set GITHUB_TOKEN for higher rate limits.' },
-  { id: 'gravatar', label: 'Gravatar public profile', run: searchGravatar, configured: () => true, note: () => process.env.GRAVATAR_API_KEY ? '' : 'Works without a key; set GRAVATAR_API_KEY for higher rate limits.' },
-  { id: 'brave', label: 'Public web pages (Brave Search API)', run: searchBrave, configured: () => !!process.env.BRAVE_SEARCH_API_KEY, note: () => process.env.BRAVE_SEARCH_API_KEY ? '' : 'Requires BRAVE_SEARCH_API_KEY on the server.' }
+  { id: 'github', stage: 'github', label: 'GitHub public profiles', run: searchGitHub, configured: () => true, note: () => process.env.GITHUB_TOKEN ? '' : 'Works without a key; set GITHUB_TOKEN for higher rate limits.' },
+  { id: 'gravatar', stage: 'gravatar', label: 'Gravatar public profile', run: searchGravatar, configured: () => true, note: () => process.env.GRAVATAR_API_KEY ? '' : 'Works without a key; set GRAVATAR_API_KEY for higher rate limits.' },
+  { id: 'brave', stage: 'web', label: 'Public web pages (Brave Search API)', run: searchBrave, configured: () => !!process.env.BRAVE_SEARCH_API_KEY, note: () => process.env.BRAVE_SEARCH_API_KEY ? '' : 'Requires BRAVE_SEARCH_API_KEY on the server.' }
 ];
 
 /** Run every source independently; one failure never hides the others, and every outcome is reported honestly. */
@@ -229,7 +358,7 @@ export async function discover(email, { fetchImpl = fetch, sources = SOURCES, ti
       findings.push(...got);
       report.push({ source: s.label, status: 'ok', detail: s.note(), count: got.length });
     } catch (e) {
-      report.push({ source: s.label, status: e.code || 'error', detail: clip(e.message, 160), count: 0 });
+      report.push({ source: s.label, status: classifyError(e).code, detail: clip(e.message, 160), count: 0 });
     }
   }));
   return { findings, report };
